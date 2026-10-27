@@ -69,15 +69,16 @@ flowchart TD
         direction TB
         H["1. Hits[id] = hit<br/>map убирает дубли<br/>при Limit: на N-м уникальном останавливает сбор"]
         I["2. IDs = отсортированные ключи<br/>порядок обхода map случайный"]
-        T["3. todo = id, которых ещё нет в кэше"]
-        F["4. fetchAll(ctx, todo)<br/>пул воркеров, схема 2"]
+        T["3. todo = id без юрданных в кэше<br/>или ещё не обогащённые (при -enrich)"]
+        F["4. fetchAll(ctx, todo)<br/>пул воркеров, схема 2:<br/>юрданные + обогащение"]
         S["5. Cache.Save()<br/>даже после отмены"]
         H --> I --> T --> F --> S
     end
 
     RUN --> CACHE["store.Cache<br/>map[int]*Supplier + RWMutex<br/>JSON-файл, атомарная запись .tmp → rename"]
-    RUN --> CSV["collect.WriteCSV<br/>BOM + заголовок + строка на каждый id"]
+    RUN --> CSV["collect.WriteCSV (колонки of_*)<br/>или поток NDJSON через OnRecord"]
     F -.->|"Get(ctx, id)"| CDN["CDN Wildberries<br/>vol/data/supplier-by-id/ID.json"]
+    F -.->|"Enrich(ctx, inn) при -enrich"| OFD["OFData<br/>/v2/company или /v2/entrepreneur"]
 ```
 
 ### 2. Пул воркеров внутри `fetchAll`
@@ -107,13 +108,13 @@ flowchart TB
         P2 --> P4 --> P5
     end
 
-    subgraph WORK["воркеры × N"]
+    subgraph WORK["воркеры × N — process(id)"]
         direction LR
         W1["for id := range jobs"]
-        W2["&lt;-tick.C<br/>общий тикер = лимит rps"]
-        W3["Client.Get(ctx, id)<br/>HTTP к CDN, ретраи на 429 и 5xx"]
-        W4["Cache.Put(s) при успехе"]
-        W5["results &lt;- err"]
+        W2["юрданные: из кэша или<br/>Client.Get (&lt;-tick.C, лимит rps)"]
+        W3["при -enrich и ИНН:<br/>Enricher.Enrich (OFData)"]
+        W4["Cache.Put(s)"]
+        W5["OnRecord → поток NDJSON<br/>results &lt;- err"]
         W1 --> W2 --> W3 --> W4 --> W5 --> W1
     end
 
@@ -220,8 +221,10 @@ flowchart TD
     C --> H["Searcher.fetchPage(collectCtx)"]
     B --> D["fetchAll(ctx, todo)<br/>исходный ctx, лимит его не трогает"]
     D --> E["Client.Get(ctx, id)"]
+    D --> E2["Enricher.Enrich(ctx, inn)<br/>при -enrich"]
     E --> F["http.NewRequestWithContext"]
     E --> G["sleep(ctx, d) между ретраями"]
+    E2 --> F
     H --> F
     H --> G
 ```
