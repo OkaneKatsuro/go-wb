@@ -276,7 +276,7 @@ func saveCSV(path string, items []Item) error {
 
 	ff := func(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 	for _, it := range items {
-		w.Write([]string{
+		row := []string{
 			it.Query,
 			strconv.Itoa(it.Page),
 			strconv.Itoa(it.Position),
@@ -299,10 +299,28 @@ func saveCSV(path string, items []Item) error {
 			it.Colors,
 			it.Sizes,
 			it.URL,
-		})
+		}
+		for i := range row {
+			row[i] = csvSafe(row[i])
+		}
+		w.Write(row)
 	}
 	w.Flush()
 	return w.Error()
+}
+
+// csvSafe обезвреживает CSV-инъекцию: значения приходят из ответа API, и если
+// ячейка начинается с =, +, -, @, таба или возврата каретки, Excel может
+// выполнить её как формулу. Префикс ' это предотвращает.
+func csvSafe(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
 }
 
 // ---------- main ----------
