@@ -27,7 +27,7 @@ type config struct {
 
 func main() {
 	var c config
-	flag.StringVar(&c.addr, "addr", ":8080", "адрес HTTP-сервера")
+	flag.StringVar(&c.addr, "addr", "127.0.0.1:8080", "адрес HTTP-сервера (слушать все интерфейсы: :8080)")
 	flag.StringVar(&c.data, "data", "out", "каталог для кэша и CSV")
 	flag.StringVar(&c.profile, "profile", "windows-chrome152.json", "профиль site-mimic для режима поиска (пусто = режим выключен)")
 	flag.StringVar(&c.proxy, "proxy", "", "прокси для поиска")

@@ -16,6 +16,20 @@ var csvHeader = []string{
 	"legalAddress", "trademark", "taxpayerCode", "supplierRating", "deactivated", "notFound", "source_query",
 }
 
+// csvSafe защищает от CSV-инъекции: имя продавца приходит от WB, и если ячейка
+// начинается с =, +, -, @, таба или возврата каретки, Excel может выполнить её
+// как формулу. Префикс ' обезвреживает такую ячейку.
+func csvSafe(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
 // WriteCSV пишет по одной строке на id. Начинает с BOM, чтобы Excel правильно открыл кириллицу.
 func WriteCSV(w io.Writer, res *Result, cache *store.Cache) (int, error) {
 	if _, err := io.WriteString(w, "\xEF\xBB\xBF"); err != nil {
@@ -44,6 +58,9 @@ func WriteCSV(w io.Writer, res *Result, cache *store.Cache) (int, error) {
 			strconv.Itoa(id), name, s.FullName, s.INN, s.OGRN, s.KPP,
 			s.LegalAddress, s.Trademark, s.TaxpayerCode, rating,
 			strconv.FormatBool(s.Deactivated), strconv.FormatBool(s.NotFound), h.Query,
+		}
+		for i := range row {
+			row[i] = csvSafe(row[i])
 		}
 		if err := cw.Write(row); err != nil {
 			return n, err

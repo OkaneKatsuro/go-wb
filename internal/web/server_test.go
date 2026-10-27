@@ -158,3 +158,25 @@ func TestBusyAndCancel(t *testing.T) {
 		t.Fatalf("cancel with nothing running: %d, want 409", code)
 	}
 }
+
+func TestCrossOriginRejected(t *testing.T) {
+	ts, _ := newTestServer(t, http.NotFound)
+
+	// Origin с чужого домена — сервер должен ответить 403.
+	req, _ := http.NewRequest("POST", ts.URL+"/api/start", strings.NewReader("mode=ids&input=1"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("кросс-доменный старт: %d, ожидался 403", resp.StatusCode)
+	}
+
+	// Без Origin (как curl) — проходит.
+	if code, _ := post(t, ts.URL+"/api/start", url.Values{"mode": {"ids"}, "input": {"1"}}); code != 202 {
+		t.Fatalf("старт без Origin: %d, ожидался 202", code)
+	}
+}

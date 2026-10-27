@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -244,7 +245,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// maxInputLines ограничивает размер одной задачи, чтобы запрос не раздул память.
+const maxInputLines = 50000
+
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(r) {
+		http.Error(w, "перекрёстный запрос отклонён", http.StatusForbidden)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<20) // 8 МБ на тело формы
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -252,6 +261,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	lines, err := wb.ParseLines(strings.NewReader(r.FormValue("input")))
 	if err != nil || len(lines) == 0 {
 		http.Error(w, "пустой ввод", http.StatusBadRequest)
+		return
+	}
+	if len(lines) > maxInputLines {
+		http.Error(w, "слишком много строк на один запуск", http.StatusRequestEntityTooLarge)
 		return
 	}
 	var src wb.Source
@@ -269,8 +282,11 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		pages, _ := strconv.Atoi(r.FormValue("pages"))
-		if pages <= 0 {
+		switch {
+		case pages <= 0:
 			pages = 3
+		case pages > 50:
+			pages = 50
 		}
 		if src, err = s.cfg.NewSearch(lines, pages); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -288,7 +304,11 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, st)
 }
 
-func (s *Server) handleCancel(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(r) {
+		http.Error(w, "перекрёстный запрос отклонён", http.StatusForbidden)
+		return
+	}
 	s.mu.Lock()
 	j := s.job
 	running := j != nil && j.state.Running
@@ -318,6 +338,21 @@ func (s *Server) handleDownload(w http.ResponseWriter, _ *http.Request) {
 	if _, err := collect.WriteCSV(w, res, s.cfg.Cache); err != nil {
 		slog.Warn("csv download", "err", err)
 	}
+}
+
+// sameOrigin защищает POST-эндпоинты от CSRF. Браузер сам проставляет Origin
+// на кросс-доменных запросах, подделать его со страницы нельзя. Нет Origin
+// (curl, тот же сайт) — пропускаем; есть и не совпадает с Host — отклоняем.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Host == r.Host
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
