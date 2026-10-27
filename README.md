@@ -235,6 +235,18 @@ docker run --rm -p 8080:8080 -v "$PWD/out:/data" wb-server
 
 Полный список флагов: `go run ./cmd/wb-sellers -h` и `go run ./cmd/wb-server -h`.
 
+### Доступ к серверу
+
+По умолчанию сервер слушает `127.0.0.1:8080`, то есть доступен только с этой машины.
+Он принимает запросы с Host `localhost`, loopback-адресов и имён, заданных через `-allowed-hosts`.
+Это защищает от CSRF и DNS-rebinding. Чтобы открыть сервер по сети или по домену:
+
+```bash
+go run ./cmd/wb-server -addr :8080 -allowed-hosts sellers.local,10.0.0.5:8080
+```
+
+Запуск в Docker через `-p 8080:8080` и обращение по `localhost:8080` работает без настройки.
+
 ## Разработка
 
 ```bash

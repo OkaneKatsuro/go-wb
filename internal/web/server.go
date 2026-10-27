@@ -11,6 +11,7 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -36,6 +37,11 @@ type Config struct {
 	// NewSearch строит Source для режима поиска. nil прячет режим поиска в интерфейсе.
 	// Это шов для других способов находить продавцов.
 	NewSearch func(queries []string, pages int) (wb.Source, error)
+
+	// AllowedHosts — имена Host сверх loopback и localhost, под которыми можно
+	// открывать сервер (напр. "sellers.local" или "10.0.0.5:8080"). Нужны, только
+	// если сервер слушает не loopback. Защищают от DNS-rebinding.
+	AllowedHosts []string
 }
 
 // State — то, что видит интерфейс; сериализуется в JSON для /api/state и /events.
@@ -63,9 +69,10 @@ type job struct {
 }
 
 type Server struct {
-	cfg  Config
-	mux  *http.ServeMux
-	tmpl *template.Template
+	cfg   Config
+	mux   *http.ServeMux
+	tmpl  *template.Template
+	hosts map[string]bool // явно разрешённые Host, помимо loopback
 
 	done     chan struct{} // закрывается в Stop: велит SSE-обработчикам выйти
 	stopOnce sync.Once
@@ -78,11 +85,18 @@ type Server struct {
 var errBusy = errors.New("задача уже выполняется")
 
 func New(cfg Config) *Server {
+	hosts := map[string]bool{}
+	for _, h := range cfg.AllowedHosts {
+		if h != "" {
+			hosts[h] = true
+		}
+	}
 	s := &Server{
-		cfg:  cfg,
-		mux:  http.NewServeMux(),
-		tmpl: template.Must(template.ParseFS(templates, "templates/*.html")),
-		done: make(chan struct{}),
+		cfg:   cfg,
+		mux:   http.NewServeMux(),
+		tmpl:  template.Must(template.ParseFS(templates, "templates/*.html")),
+		done:  make(chan struct{}),
+		hosts: hosts,
 	}
 	// Шаблоны Go 1.22: метод + путь, "{$}" значит «ровно /».
 	s.mux.HandleFunc("GET /{$}", s.handleIndex)
@@ -96,7 +110,40 @@ func New(cfg Config) *Server {
 }
 
 // ServeHTTP делает *Server реализацией http.Handler.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+// Сначала проверяет Host, потом отдаёт запрос в mux.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.allowedHost(r.Host) {
+		http.Error(w, "неизвестный Host", http.StatusForbidden)
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
+
+// allowedHost — барьер против DNS-rebinding. Атака работает так: домен
+// attacker.com резолвится в 127.0.0.1, браузер шлёт на наш сервер запрос с
+// Host: attacker.com, и Origin совпадает с Host. Поэтому мало сравнить
+// Origin с Host — нужно убедиться, что сам Host наш. Пускаем только loopback
+// и localhost (любой порт, чтобы тесты со случайным портом работали) плюс
+// имена, заданные оператором через AllowedHosts.
+func (s *Server) allowedHost(host string) bool {
+	if host == "" {
+		return true // HTTP/2 может не прислать Host; тело уже защищено проверкой Origin
+	}
+	if s.hosts[host] {
+		return true
+	}
+	hostname := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+	}
+	if s.hosts[hostname] || hostname == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(hostname); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
 
 // Stop отменяет текущую задачу, дожидается её и освобождает SSE-соединения,
 // чтобы http.Server.Shutdown смог завершиться.
@@ -340,10 +387,16 @@ func (s *Server) handleDownload(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-// sameOrigin защищает POST-эндпоинты от CSRF. Браузер сам проставляет Origin
-// на кросс-доменных запросах, подделать его со страницы нельзя. Нет Origin
-// (curl, тот же сайт) — пропускаем; есть и не совпадает с Host — отклоняем.
+// sameOrigin защищает POST-эндпоинты от CSRF. Host уже проверен в ServeHTTP,
+// поэтому здесь сравнение Origin с Host безопасно (Host заведомо наш).
+// Браузер сам проставляет Origin и Sec-Fetch-Site на кросс-доменных запросах,
+// подделать их со страницы нельзя. Запросы без этих заголовков (curl, свой сайт)
+// пропускаем.
 func sameOrigin(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "cross-site", "same-site":
+		return false
+	}
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true

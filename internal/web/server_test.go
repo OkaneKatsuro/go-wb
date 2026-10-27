@@ -180,3 +180,49 @@ func TestCrossOriginRejected(t *testing.T) {
 		t.Fatalf("старт без Origin: %d, ожидался 202", code)
 	}
 }
+
+func TestForeignHostRejected(t *testing.T) {
+	ts, _ := newTestServer(t, http.NotFound)
+
+	// Чужой Host (как при DNS-rebinding) — 403, даже на безобидном GET.
+	req, _ := http.NewRequest("GET", ts.URL+"/healthz", nil)
+	req.Host = "attacker.example"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("чужой Host: %d, ожидался 403", resp.StatusCode)
+	}
+
+	// Loopback (127.0.0.1 из ts.URL) проходит — обычный healthz.
+	if code, body := get(t, ts.URL+"/healthz"); code != 200 || body != "ok" {
+		t.Fatalf("loopback healthz: %d %q", code, body)
+	}
+}
+
+func TestAllowedHostPasses(t *testing.T) {
+	cache, _ := store.Load(t.TempDir() + "/c.json")
+	srv := New(Config{
+		DataDir:      t.TempDir(),
+		Cache:        cache,
+		Client:       wb.NewSupplierClient(1000),
+		Workers:      1,
+		AllowedHosts: []string{"sellers.local"},
+	})
+	t.Cleanup(srv.Stop)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest("GET", ts.URL+"/healthz", nil)
+	req.Host = "sellers.local"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("разрешённый Host: %d, ожидался 200", resp.StatusCode)
+	}
+}
