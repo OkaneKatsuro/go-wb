@@ -89,7 +89,14 @@ func run(c config) error {
 		}
 	}
 	app := web.New(cfg)
-	srv := &http.Server{Addr: c.addr, Handler: app, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Addr:              c.addr,
+		Handler:           app,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second, // форма с id до 8 МБ успеет, медленный клиент — нет
+		IdleTimeout:       2 * time.Minute,
+		// WriteTimeout не задан: /events держит соединение открытым, пока идёт задача.
+	}
 
 	errc := make(chan error, 1)
 	if host, _, _ := net.SplitHostPort(c.addr); !isLoopback(host) && len(allowed) == 0 {

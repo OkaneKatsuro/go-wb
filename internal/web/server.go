@@ -100,7 +100,7 @@ func New(cfg Config) *Server {
 	}
 	// Шаблоны Go 1.22: метод + путь, "{$}" значит «ровно /».
 	s.mux.HandleFunc("GET /{$}", s.handleIndex)
-	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") })
+	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
 	s.mux.HandleFunc("GET /api/state", s.handleState)
 	s.mux.HandleFunc("GET /events", s.handleEvents)
 	s.mux.HandleFunc("POST /api/start", s.handleStart)
@@ -110,14 +110,25 @@ func New(cfg Config) *Server {
 }
 
 // ServeHTTP делает *Server реализацией http.Handler.
-// Сначала проверяет Host, потом отдаёт запрос в mux.
+// Сначала проверяет Host, ставит защитные заголовки, потом отдаёт запрос в mux.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.allowedHost(r.Host) {
 		http.Error(w, "неизвестный Host", http.StatusForbidden)
 		return
 	}
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff") // не угадывать тип: CSV и JSON остаются тем, чем названы
+	h.Set("X-Frame-Options", "DENY")           // страницу нельзя встроить во фрейм чужого сайта (clickjacking)
+	h.Set("Referrer-Policy", "no-referrer")    // не отдавать адрес сервера по внешним ссылкам
+	h.Set("Content-Security-Policy", basicCSP) // только свой origin; inline-скрипт страницы разрешён явно
 	s.mux.ServeHTTP(w, r)
 }
+
+// basicCSP разрешает ресурсы только с нашего origin. Страница одна и живёт в
+// шаблоне со встроенными <script> и <style>, поэтому для них включён
+// 'unsafe-inline'; внешние скрипты, фреймы и формы на другие адреса запрещены.
+const basicCSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'"
 
 // allowedHost — барьер против DNS-rebinding. Атака работает так: домен
 // attacker.com резолвится в 127.0.0.1, браузер шлёт на наш сервер запрос с
@@ -266,20 +277,29 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	// http.Server.ReadTimeout потоку не мешает: net/http снимает дедлайн чтения,
+	// как только запрос прочитан (startBackgroundRead). WriteTimeout мешал бы,
+	// поэтому в cmd/wb-server он не задан. Тест TestEventsSurviveReadTimeout это пинит.
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	var sent uint64 = ^uint64(0) // пока ничего не отправлено; форсирует первое сообщение
+	sent := ^uint64(0) // пока ничего не отправлено; форсирует первое сообщение
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
 	for {
 		if st := s.state(); st.Version != sent {
 			sent = st.Version
-			b, _ := json.Marshal(st)
-			fmt.Fprintf(w, "data: %s\n\n", b)
+			b, err := json.Marshal(st)
+			if err != nil {
+				slog.Warn("sse: json", "err", err)
+				return
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+				return // соединение закрыто, браузер переподключится сам
+			}
 			fl.Flush()
 		}
 		select {
@@ -292,8 +312,30 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// maxInputLines ограничивает размер одной задачи, чтобы запрос не раздул память.
-const maxInputLines = 50000
+// Границы ввода одной задачи: число строк (память), страниц на запрос (нагрузка на WB).
+const (
+	maxInputLines = 50000
+	defaultPages  = 3
+	maxPages      = 50
+	maxLimit      = 1_000_000
+)
+
+// formInt читает целое поле формы. Пустое поле даёт def; нечисловое или вне
+// [lo, hi] — ошибку для ответа 400, а не молчаливую подмену.
+func formInt(r *http.Request, name string, def, lo, hi int) (int, error) {
+	raw := strings.TrimSpace(r.FormValue(name))
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("поле %s: нужно целое число", name)
+	}
+	if v < lo || v > hi {
+		return 0, fmt.Errorf("поле %s: допустимо от %d до %d", name, lo, hi)
+	}
+	return v, nil
+}
 
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !sameOrigin(r) {
@@ -306,12 +348,21 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lines, err := wb.ParseLines(strings.NewReader(r.FormValue("input")))
-	if err != nil || len(lines) == 0 {
+	if err != nil {
+		http.Error(w, "ввод не разобран: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(lines) == 0 {
 		http.Error(w, "пустой ввод", http.StatusBadRequest)
 		return
 	}
 	if len(lines) > maxInputLines {
 		http.Error(w, "слишком много строк на один запуск", http.StatusRequestEntityTooLarge)
+		return
+	}
+	limit, err := formInt(r, "limit", 0, 0, maxLimit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	var src wb.Source
@@ -328,12 +379,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "режим поиска выключен", http.StatusBadRequest)
 			return
 		}
-		pages, _ := strconv.Atoi(r.FormValue("pages"))
-		switch {
-		case pages <= 0:
-			pages = 3
-		case pages > 50:
-			pages = 50
+		// pages разбирается только здесь: в режиме ids скрытое поле формы
+		// всё равно отправляется, и его значение не должно мешать запуску.
+		pages, err := formInt(r, "pages", defaultPages, 1, maxPages)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		if src, err = s.cfg.NewSearch(lines, pages); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -342,10 +393,6 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "неизвестный режим", http.StatusBadRequest)
 		return
-	}
-	limit, _ := strconv.Atoi(r.FormValue("limit"))
-	if limit < 0 {
-		limit = 0
 	}
 	st, err := s.start(src, limit)
 	if errors.Is(err, errBusy) {
