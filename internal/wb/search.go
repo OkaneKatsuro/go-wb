@@ -20,6 +20,15 @@ import (
 // Мы здесь намеренно останавливаемся и не пытаемся её обойти.
 var ErrChallenge = errors.New("search.wb.ru вернул 498 (JS-проверка), остановка")
 
+// defaultSearchBaseURL — поисковый API WB; в тестах подменяется на httptest-сервер.
+const defaultSearchBaseURL = "https://search.wb.ru"
+
+// maxSearchBody — предел размера страницы выдачи. Реальные ответы — сотни килобайт.
+const maxSearchBody = 16 << 20
+
+// statusChallenge — нестандартный код WB для JS-проверки антибота.
+const statusChallenge = 498
+
 // Шарды возвращают одинаковые результаты; их ротация помогает при 429.
 var shards = []string{"common", "male", "female", "sport", "kids", "beauty", "electronic", "household"}
 
@@ -48,12 +57,15 @@ func (r searchResp) items() []product {
 // Searcher обращается к поисковому API WB через клиент site-mimic.
 // Небезопасен для конкурентного доступа: shardIdx и streak429 — обычные поля.
 type Searcher struct {
-	client   *http.Client
-	profile  mimic.Profile
-	dest     string
-	version  string
-	minDelay time.Duration
-	maxDelay time.Duration
+	client    *http.Client
+	profile   mimic.Profile
+	baseURL   string
+	dest      string
+	version   string
+	minDelay  time.Duration // пауза между страницами, от
+	maxDelay  time.Duration // и до (случайно в этом диапазоне)
+	retryWait time.Duration // пауза после 429 или сетевой ошибки
+	longWait  time.Duration // пауза после серии из 429
 
 	// DumpPath, если задан, получает первый сырой ответ 200 и затем очищается.
 	DumpPath string
@@ -77,13 +89,14 @@ func NewSearcher(profilePath, proxy, dest, version string) (*Searcher, error) {
 	}
 	c.Timeout = 30 * time.Second
 	return &Searcher{
-		client: c, profile: p, dest: dest, version: version,
+		client: c, profile: p, baseURL: defaultSearchBaseURL, dest: dest, version: version,
 		minDelay: 1 * time.Second, maxDelay: 2 * time.Second,
+		retryWait: 2 * time.Second, longWait: 30 * time.Second,
 	}, nil
 }
 
 func (s *Searcher) pause(ctx context.Context) error {
-	return sleep(ctx, s.minDelay+rand.N(s.maxDelay-s.minDelay+1))
+	return Sleep(ctx, s.minDelay+rand.N(s.maxDelay-s.minDelay+1))
 }
 
 func (s *Searcher) url(shard, query string, page int) string {
@@ -98,7 +111,7 @@ func (s *Searcher) url(shard, query string, page int) string {
 	q.Set("resultset", "catalog")
 	q.Set("sort", "popular")
 	q.Set("spp", "30")
-	return fmt.Sprintf("https://search.wb.ru/exactmatch/ru/%s/%s/search?%s", shard, s.version, q.Encode())
+	return fmt.Sprintf("%s/exactmatch/ru/%s/%s/search?%s", s.baseURL, shard, s.version, q.Encode())
 }
 
 // fetchPage возвращает товары одной страницы. Обрабатывает 429 ротацией шардов.
@@ -117,21 +130,21 @@ func (s *Searcher) fetchPage(ctx context.Context, query string, page int) ([]pro
 			}
 			if attempt < maxRetries {
 				slog.Warn("сеть, повтор", "err", err)
-				if err := sleep(ctx, 2*time.Second); err != nil {
+				if err := Sleep(ctx, s.retryWait); err != nil {
 					return nil, err
 				}
 				continue
 			}
 			return nil, err
 		}
-		body, err := readBody(resp)
-		resp.Body.Close()
+		body, err := readBody(resp, maxSearchBody)
+		_ = resp.Body.Close() // ошибка закрытия тела ответа ничего не добавляет к ошибке чтения
 		if err != nil {
 			return nil, fmt.Errorf("чтение ответа: %w", err)
 		}
 
-		switch {
-		case resp.StatusCode == http.StatusOK:
+		switch resp.StatusCode {
+		case http.StatusOK:
 			s.streak429 = 0
 			if s.DumpPath != "" {
 				if err := os.WriteFile(s.DumpPath, body, 0o644); err != nil {
@@ -145,25 +158,24 @@ func (s *Searcher) fetchPage(ctx context.Context, query string, page int) ([]pro
 			}
 			return r.items(), nil
 
-		case resp.StatusCode == 498:
+		case statusChallenge:
 			return nil, ErrChallenge
 
-		case resp.StatusCode == http.StatusTooManyRequests:
+		case http.StatusTooManyRequests:
 			s.streak429++
 			s.shardIdx++
-			wait := 2 * time.Second
+			if attempt >= maxRetries {
+				return nil, fmt.Errorf("429 после %d повторов", maxRetries)
+			}
+			wait := s.retryWait
 			if s.streak429 >= 5 {
 				slog.Warn("серия 429, длинная пауза", "streak", s.streak429)
-				wait = 30 * time.Second
+				wait = s.longWait
 				s.streak429 = 0
 			}
-			if err := sleep(ctx, wait); err != nil {
+			if err := Sleep(ctx, wait); err != nil {
 				return nil, err
 			}
-			if attempt < maxRetries {
-				continue
-			}
-			return nil, fmt.Errorf("429 после %d повторов", maxRetries)
 
 		default:
 			return nil, fmt.Errorf("статус %d (начало: %.200s)", resp.StatusCode, body)

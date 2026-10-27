@@ -83,9 +83,10 @@ func (q QuerySearch) Collect(ctx context.Context, emit func(SellerHit)) error {
 	return nil
 }
 
-// sleep ждёт d или отмены ctx — что наступит раньше.
-// time.Sleep прервать нельзя, а это можно.
-func sleep(ctx context.Context, d time.Duration) error {
+// Sleep ждёт d или отмены ctx — что наступит раньше.
+// time.Sleep прервать нельзя, а это можно. Используется и клиентами других
+// пакетов (ofdata), чтобы пауза между повторами везде была одинаковой.
+func Sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

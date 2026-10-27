@@ -2,8 +2,10 @@ package wb
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +36,27 @@ func TestSupplierURL(t *testing.T) {
 	}
 }
 
+func TestValidINN(t *testing.T) {
+	tests := map[string]bool{
+		"7707083893":    true,  // юрлицо
+		"544052334508":  true,  // ИП
+		"":              false, // нет ИНН
+		"770708389":     false, // 9 цифр
+		"77070838931":   false, // 11 цифр
+		"7707O83893":    false, // буква O вместо нуля
+		"123456789":     false, // УНП Беларуси
+		"123456789012x": false,
+	}
+	for inn, want := range tests {
+		if got := ValidINN(inn); got != want {
+			t.Errorf("ValidINN(%q) = %v, want %v", inn, got, want)
+		}
+	}
+	if !IsIP("544052334508") || IsIP("7707083893") {
+		t.Fatal("IsIP: 12 цифр — ИП, 10 — юрлицо")
+	}
+}
+
 func TestGetRetriesOn429(t *testing.T) {
 	var calls atomic.Int32
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +67,7 @@ func TestGetRetriesOn429(t *testing.T) {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		w.Write([]byte(`{"supplierName":"ООО Ромашка","inn":"7700000000","ogrn":"","ogrnip":"300000000000000"}`))
+		_, _ = w.Write([]byte(`{"supplierName":"ООО Ромашка","inn":"7700000000","ogrn":"","ogrnip":"300000000000000"}`))
 	})
 	s, err := c.Get(context.Background(), 123456)
 	if err != nil {
@@ -61,8 +84,23 @@ func TestGetRetriesOn429(t *testing.T) {
 	}
 }
 
+func TestGetGivesUpAfterRetriesOn5xx(t *testing.T) {
+	var calls atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	_, err := c.Get(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("err = %v, want статус 503", err)
+	}
+	if calls.Load() != 4 { // первая попытка + 3 повтора
+		t.Fatalf("calls = %d, want 4", calls.Load())
+	}
+}
+
 func TestGetNotFound(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 	s, err := c.Get(context.Background(), 5)
@@ -76,7 +114,7 @@ func TestGetNotFound(t *testing.T) {
 
 func TestGetDoesNotRetryOn403(t *testing.T) {
 	var calls atomic.Int32
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusForbidden)
 	})
@@ -88,8 +126,18 @@ func TestGetDoesNotRetryOn403(t *testing.T) {
 	}
 }
 
+func TestGetRejectsHugeBody(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"supplierName":"` + strings.Repeat("x", maxSupplierBody) + `"}`))
+	})
+	_, err := c.Get(context.Background(), 1)
+	if !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("err = %v, want ErrBodyTooLarge", err)
+	}
+}
+
 func TestGetHonoursCancel(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done() // висим, пока клиент не сдастся
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -101,5 +149,25 @@ func TestGetHonoursCancel(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Fatalf("Get ignored context, took %s", time.Since(start))
+	}
+}
+
+func TestGetRateLimits(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := NewSupplierClient(20) // 50 мс на запрос
+	c.BaseURL = srv.URL
+
+	start := time.Now()
+	for i := range 5 {
+		if _, err := c.Get(context.Background(), i+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Первый запрос мгновенный (burst 1), остальные четыре ждут по 50 мс.
+	if d := time.Since(start); d < 150*time.Millisecond {
+		t.Fatalf("5 запросов при 20 rps заняли %s, лимит не работает", d)
 	}
 }

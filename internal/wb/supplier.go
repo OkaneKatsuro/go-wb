@@ -3,13 +3,20 @@ package wb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // DefaultBaseURL — публичный CDN WB с юридическими данными продавцов.
 const DefaultBaseURL = "https://static-basket-01.wbbasket.ru"
+
+// maxSupplierBody — предел размера JSON одного продавца. Реальные ответы — сотни байт.
+const maxSupplierBody = 1 << 20
 
 // Supplier — юридические данные одного продавца WB в том виде, в каком их отдаёт CDN:
 // {BaseURL}/vol{id/1000}/data/supplier-by-id/{id}.json
@@ -32,6 +39,7 @@ type Supplier struct {
 	NotFound bool `json:"notFound,omitempty"`
 	// Enrich — обогащение из внешнего реестра (OFData), nil пока не запрашивали.
 	// Хранится прямо в Supplier, поэтому кэш сохраняет его между запусками.
+	// Объект в кэше после Put не меняется: кто хочет дописать Enrich, делает копию.
 	Enrich *Enrichment `json:"enrich,omitempty"`
 }
 
@@ -52,11 +60,35 @@ type Enrichment struct {
 	OkvedName  string `json:"okvedName,omitempty"`  // основной ОКВЭД, название
 	Director   string `json:"director,omitempty"`   // руководитель (ЮЛ) или сам ИП
 	Source     string `json:"source"`               // источник, напр. "ofdata"
+	// NotFound — реестр ответил, что записи по этому ИНН нет. Запись с NotFound
+	// хранится в кэше, чтобы повторный прогон не платил за тот же запрос снова.
+	NotFound bool `json:"notFound,omitempty"`
 }
+
+// ErrEnrichUnavailable — обогащение дальше невозможно в этом прогоне (реестр
+// отклонил ключ, исчерпан баланс). Реализации Enricher оборачивают им свою
+// ошибку, а collect.Runner по нему останавливает прогон, а не повторяет
+// обречённый запрос для каждого следующего продавца.
+var ErrEnrichUnavailable = errors.New("обогащение недоступно")
 
 // IsIP сообщает, что ИНН принадлежит индивидуальному предпринимателю.
 // У ИП ИНН из 12 цифр, у юрлица — из 10.
 func IsIP(inn string) bool { return len(inn) == 12 }
+
+// ValidINN проверяет форму российского ИНН: 10 цифр у юрлица, 12 у ИП.
+// Продавцы из Беларуси и Казахстана несут УНП/БИН, в реестре ЕГРЮЛ их нет,
+// поэтому для них обогащение не запрашивается.
+func ValidINN(inn string) bool {
+	if len(inn) != 10 && len(inn) != 12 {
+		return false
+	}
+	for i := range len(inn) {
+		if inn[i] < '0' || inn[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // SupplierClient получает записи Supplier с общим ограничением скорости.
 // Безопасен для конкурентного доступа.
@@ -66,8 +98,8 @@ type SupplierClient struct {
 	// Backoff — пауза перед первым повтором; дальше растёт линейно.
 	Backoff time.Duration
 
-	http *http.Client
-	tick *time.Ticker // один тик = право на один запрос, общий для всех воркеров
+	http    *http.Client
+	limiter *rate.Limiter // общий для всех воркеров: rps запросов в секунду, без очереди
 }
 
 func NewSupplierClient(rps int) *SupplierClient {
@@ -78,7 +110,7 @@ func NewSupplierClient(rps int) *SupplierClient {
 		BaseURL: DefaultBaseURL,
 		Backoff: 2 * time.Second,
 		http:    &http.Client{Timeout: 20 * time.Second},
-		tick:    time.NewTicker(time.Second / time.Duration(rps)),
+		limiter: rate.NewLimiter(rate.Limit(rps), 1),
 	}
 }
 
@@ -92,10 +124,8 @@ func (c *SupplierClient) Get(ctx context.Context, id int) (*Supplier, error) {
 	const maxRetries = 3
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-c.tick.C:
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, err
 		}
 		s, retry, err := c.fetch(ctx, id)
 		if err == nil {
@@ -105,10 +135,10 @@ func (c *SupplierClient) Get(ctx context.Context, id int) (*Supplier, error) {
 			return nil, ctx.Err()
 		}
 		lastErr = err
-		if !retry {
+		if !retry || attempt == maxRetries {
 			break
 		}
-		if err := sleep(ctx, time.Duration(attempt+1)*c.Backoff); err != nil {
+		if err := Sleep(ctx, time.Duration(attempt+1)*c.Backoff); err != nil {
 			return nil, err
 		}
 	}
@@ -127,27 +157,31 @@ func (c *SupplierClient) fetch(ctx context.Context, id int) (*Supplier, bool, er
 	if err != nil {
 		return nil, true, err
 	}
-	body, err := readBody(resp)
-	resp.Body.Close()
+	body, err := readBody(resp, maxSupplierBody)
+	_ = resp.Body.Close() // ошибка закрытия тела ответа ничего не добавляет к ошибке чтения
 	if err != nil {
 		return nil, true, fmt.Errorf("чтение ответа: %w", err)
 	}
-	switch {
-	case resp.StatusCode == http.StatusOK:
+	switch resp.StatusCode {
+	case http.StatusOK:
 		s := &Supplier{}
 		if err := json.Unmarshal(body, s); err != nil {
 			return nil, false, fmt.Errorf("разбор JSON: %w (начало: %.200s)", err, body)
 		}
 		s.ID = id
+		s.INN = strings.TrimSpace(s.INN) // ValidINN и реестр ждут ровно цифры
 		if s.OGRN == "" {
 			s.OGRN = s.OGRNIP // у ИП номер лежит в отдельном поле
 		}
 		return s, false, nil
-	case resp.StatusCode == http.StatusNotFound:
+	case http.StatusNotFound:
 		return &Supplier{ID: id, NotFound: true}, false, nil
-	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+	case http.StatusTooManyRequests:
 		return nil, true, fmt.Errorf("статус %d", resp.StatusCode)
 	default:
+		if resp.StatusCode >= 500 {
+			return nil, true, fmt.Errorf("статус %d", resp.StatusCode)
+		}
 		return nil, false, fmt.Errorf("статус %d (начало: %.200s)", resp.StatusCode, body)
 	}
 }

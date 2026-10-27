@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// maxLineBytes — предел длины одной строки ввода. Строка длиннее — не id и не
+// запрос, а мусор; ParseLines вернёт bufio.ErrTooLong вместо тихого обрыва.
+const maxLineBytes = 1 << 20
+
 // ReadLines возвращает значимые строки текстового файла: обрезанные по краям,
 // непустые, без строк, начинающихся с #.
 func ReadLines(path string) ([]string, error) {
@@ -15,14 +19,18 @@ func ReadLines(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return ParseLines(f)
+	lines, err := ParseLines(f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return lines, err
 }
 
 // ParseLines — это ReadLines поверх любого reader (файл, поле HTTP-формы, строка).
 func ParseLines(r io.Reader) ([]string, error) {
 	var res []string
 	sc := bufio.NewScanner(r)
+	sc.Buffer(nil, maxLineBytes)
 	for sc.Scan() {
 		l := strings.TrimSpace(sc.Text())
 		if l != "" && !strings.HasPrefix(l, "#") {
@@ -36,7 +44,7 @@ func ParseLines(r io.Reader) ([]string, error) {
 // ссылкой на продавца вида https://www.wildberries.ru/seller/12345?sort=popular.
 // Строки, которые не то и не другое, пропускаются.
 func ParseIDs(lines []string) []int {
-	var ids []int
+	ids := make([]int, 0, len(lines))
 	for _, l := range lines {
 		if id := parseID(l); id > 0 {
 			ids = append(ids, id)
