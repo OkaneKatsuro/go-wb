@@ -57,12 +57,16 @@ func NewNDJSONWriter(w io.Writer) *NDJSONWriter {
 }
 
 // Write кодирует одну запись и завершает её переводом строки (это делает Encode).
-func (nw *NDJSONWriter) Write(rec Record) {
+// Ошибка записи возвращается наружу: Runner по ней останавливает прогон.
+// Подходит как Runner.OnRecord.
+func (nw *NDJSONWriter) Write(rec Record) error {
 	nw.mu.Lock()
 	defer nw.mu.Unlock()
-	if err := nw.enc.Encode(flatten(rec)); err == nil {
-		nw.n++
+	if err := nw.enc.Encode(flatten(rec)); err != nil {
+		return err
 	}
+	nw.n++
+	return nil
 }
 
 // Count — сколько строк записано.

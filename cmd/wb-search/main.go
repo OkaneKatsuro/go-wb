@@ -1,8 +1,8 @@
 package main
 
 import (
-	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +16,8 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/stealth"
+
+	"github.com/OkaneKatsuro/go-wb/internal/collect"
 )
 
 const searchURL = "https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search"
@@ -256,23 +258,32 @@ func searchAll(page *rod.Page, query string, pages int) ([]Item, error) {
 
 // ---------- CSV ----------
 
-func saveCSV(path string, items []Item) error {
+// saveCSV пишет товары через общий collect.ExcelWriter: BOM и защита от
+// CSV-инъекции в одном месте для всех экспортов проекта.
+func saveCSV(path string, items []Item) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		// Ошибка Close — это недописанный файл, её нельзя терять.
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
 
-	// BOM, чтобы Excel правильно открыл кириллицу
-	f.WriteString("\xEF\xBB\xBF")
-
-	w := csv.NewWriter(f)
-	w.Write([]string{
+	w, err := collect.NewExcelWriter(f)
+	if err != nil {
+		return err
+	}
+	if err := w.Write([]string{
 		"query", "page", "position", "id", "name", "entity", "brand", "brand_id",
 		"supplier", "supplier_id", "supplier_rating", "subject_id",
 		"rating", "feedbacks", "price", "base_price", "discount_pct",
 		"quantity", "pics", "colors", "sizes", "url",
-	})
+	}); err != nil {
+		return err
+	}
 
 	ff := func(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 	for _, it := range items {
@@ -300,27 +311,11 @@ func saveCSV(path string, items []Item) error {
 			it.Sizes,
 			it.URL,
 		}
-		for i := range row {
-			row[i] = csvSafe(row[i])
+		if err := w.Write(row); err != nil {
+			return err
 		}
-		w.Write(row)
 	}
-	w.Flush()
-	return w.Error()
-}
-
-// csvSafe обезвреживает CSV-инъекцию: значения приходят из ответа API, и если
-// ячейка начинается с =, +, -, @, таба или возврата каретки, Excel может
-// выполнить её как формулу. Префикс ' это предотвращает.
-func csvSafe(s string) string {
-	if s == "" {
-		return s
-	}
-	switch s[0] {
-	case '=', '+', '-', '@', '\t', '\r':
-		return "'" + s
-	}
-	return s
+	return w.Flush()
 }
 
 // ---------- main ----------
@@ -337,26 +332,34 @@ func main() {
 	if *out == "" {
 		*out = fmt.Sprintf("wb_%s.csv", time.Now().Format("20060102_150405"))
 	}
+	if err := run(*query, *pages, *out); err != nil {
+		log.Fatal(err)
+	}
+}
 
+// run возвращает ошибку вместо log.Fatal, чтобы defer успел закрыть браузер:
+// после os.Exit отложенные вызовы не выполняются, и процесс Chrome остался бы висеть.
+func run(query string, pages int, out string) error {
 	browser, page := openBrowser()
 	defer browser.MustClose()
 
-	if err := waitToken(page, *query, 30*time.Second); err != nil {
-		log.Fatal(err)
+	if err := waitToken(page, query, 30*time.Second); err != nil {
+		return err
 	}
 	fmt.Println("токен получен")
 
-	items, err := searchAll(page, *query, *pages)
+	items, err := searchAll(page, query, pages)
 	if err != nil {
 		// сохраняем то, что успели собрать
 		log.Println("ошибка:", err)
 	}
 	if len(items) == 0 {
-		log.Fatal("ничего не найдено")
+		return errors.New("ничего не найдено")
 	}
 
-	if err := saveCSV(*out, items); err != nil {
-		log.Fatal("csv: ", err)
+	if err := saveCSV(out, items); err != nil {
+		return fmt.Errorf("csv: %w", err)
 	}
-	fmt.Printf("сохранено %d товаров в %s\n", len(items), *out)
+	fmt.Printf("сохранено %d товаров в %s\n", len(items), out)
+	return nil
 }

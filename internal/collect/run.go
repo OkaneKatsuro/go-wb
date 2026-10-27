@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/OkaneKatsuro/go-wb/internal/store"
@@ -33,14 +34,22 @@ type Progress struct {
 
 // Result — то, что дал прогон. IDs отсортированы; в Hits по записи на каждый id.
 type Result struct {
-	IDs     []int
-	Hits    map[int]wb.SellerHit
-	Failed  int    // запросы юрданных, сдавшиеся после повторов
-	Warning string // нефатальная проблема, напр. поиск остановлен ErrChallenge
+	IDs  []int
+	Hits map[int]wb.SellerHit
+	// Failed — продавцы, по которым юрданные не получены после повторов.
+	Failed int
+	// EnrichFailed — продавцы, у которых юрданные есть, а обогащение упало.
+	// В кэш такое не пишется, следующий прогон попробует снова.
+	EnrichFailed int
+	Warning      string // нефатальная проблема, напр. поиск остановлен ErrChallenge
 }
 
 // Enricher обогащает продавца по ИНН данными из внешнего реестра.
-// Возвращает (nil, nil), если запись не найдена. Реализация — ofdata.Client.
+// Если записи в реестре нет, возвращает Enrichment с NotFound=true (не nil):
+// Runner кладёт его в кэш, и повторный прогон не спрашивает реестр снова.
+// Ошибка, обёрнутая в wb.ErrEnrichUnavailable (ключ отклонён), останавливает
+// весь прогон: повторять её для каждого продавца бессмысленно.
+// Реализация — ofdata.Client.
 type Enricher interface {
 	Enrich(ctx context.Context, inn string) (*wb.Enrichment, error)
 }
@@ -68,13 +77,33 @@ type Runner struct {
 	OnProgress func(Progress)
 	// OnRecord необязателен. Вызывается из воркеров по мере готовности продавца,
 	// поэтому должен быть потокобезопасным. Для потокового NDJSON-вывода.
-	OnRecord func(Record)
+	// Ошибка из OnRecord останавливает прогон: если поток вывода сломан,
+	// продолжать ходить в сеть нет смысла. Run вернёт эту ошибку.
+	OnRecord func(Record) error
+}
+
+// validate ловит незаполненный Runner до запуска, чтобы ошибка конфигурации
+// не превращалась в панику посреди прогона.
+func (r *Runner) validate() error {
+	switch {
+	case r.Source == nil:
+		return errors.New("collect: не задан Source")
+	case r.Cache == nil:
+		return errors.New("collect: не задан Cache")
+	case r.Client == nil && !r.SearchOnly:
+		return errors.New("collect: не задан Client")
+	}
+	return nil
 }
 
 // wantEnrich сообщает, нужно ли обогащать этого продавца и можно ли (по ИНН).
+// ИНН подрезается на случай старого кэша: новые записи CDN подрезает при разборе.
 func (r *Runner) wantEnrich(s *wb.Supplier) bool {
-	return r.Enricher != nil && s != nil && !s.NotFound && s.INN != "" &&
-		(!wb.IsIP(s.INN) || r.EnrichIP)
+	if r.Enricher == nil || s == nil || s.NotFound {
+		return false
+	}
+	inn := strings.TrimSpace(s.INN)
+	return wb.ValidINN(inn) && (!wb.IsIP(inn) || r.EnrichIP)
 }
 
 func (r *Runner) report(p Progress) {
@@ -85,7 +114,11 @@ func (r *Runner) report(p Progress) {
 
 // Run выполняет оба этапа. При ошибке возвращённый Result всё равно содержит
 // всё, что успели собрать, чтобы вызывающий мог сохранить частичный результат.
+// Исключение — ошибка конфигурации: тогда Result равен nil.
 func (r *Runner) Run(ctx context.Context) (*Result, error) {
+	if err := r.validate(); err != nil {
+		return nil, err
+	}
 	res := &Result{Hits: map[int]wb.SellerHit{}}
 
 	// Отдельный контекст сбора: достигнув лимита, отменяем только его, чтобы
@@ -96,6 +129,9 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 
 	r.report(Progress{Stage: StageSearch, Message: "сбор supplierId"})
 	err := r.Source.Collect(collectCtx, func(h wb.SellerHit) {
+		if reachedLimit {
+			return // источник не проверил ctx после отмены; лишнее не берём
+		}
 		if _, ok := res.Hits[h.SupplierID]; ok {
 			return
 		}
@@ -152,6 +188,14 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	return res, nil
 }
 
+// procResult — итог обработки одного продавца воркером.
+type procResult struct {
+	id        int
+	err       error // юрданные не получены; продавец в кэш не попал
+	enrichErr error // юрданные есть и сохранены, обогащение не удалось
+	sinkErr   error // OnRecord вернул ошибку: прогон надо остановить
+}
+
 // fetchAll — пул воркеров по схеме fan-out/fan-in.
 //
 //	производитель ──jobs──▶ N воркеров ──results──▶ эта горутина
@@ -162,6 +206,10 @@ func (r *Runner) fetchAll(ctx context.Context, todo []int, res *Result) error {
 	if len(todo) == 0 {
 		return ctx.Err()
 	}
+	// Свой контекст, чтобы остановить пул изнутри, если сломался OnRecord.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	workers := max(r.Workers, 1)
 	saveEvery := r.SaveEvery
 	if saveEvery <= 0 {
@@ -169,7 +217,7 @@ func (r *Runner) fetchAll(ctx context.Context, todo []int, res *Result) error {
 	}
 
 	jobs := make(chan int)
-	results := make(chan error)
+	results := make(chan procResult)
 
 	var wg sync.WaitGroup
 	for range workers {
@@ -193,12 +241,27 @@ func (r *Runner) fetchAll(ctx context.Context, todo []int, res *Result) error {
 		close(results)
 	}()
 
+	var fatal error // ошибка вывода или недоступное обогащение: прогон остановлен нами
 	done := 0
-	for err := range results {
+	for pr := range results {
 		done++
-		if err != nil && ctx.Err() == nil {
+		switch {
+		case pr.sinkErr != nil:
+			if fatal == nil {
+				fatal = fmt.Errorf("вывод записи: %w", pr.sinkErr)
+				cancel()
+			}
+		case errors.Is(pr.enrichErr, wb.ErrEnrichUnavailable):
+			if fatal == nil {
+				fatal = fmt.Errorf("обогащение остановлено, юрданные сохранены в кэш: %w", pr.enrichErr)
+				cancel()
+			}
+		case pr.err != nil && ctx.Err() == nil:
 			res.Failed++
-			slog.Warn("юрданные", "err", err)
+			slog.Warn("юрданные", "id", pr.id, "err", pr.err)
+		case pr.enrichErr != nil:
+			res.EnrichFailed++
+			slog.Warn("обогащение", "id", pr.id, "err", pr.enrichErr)
 		}
 		if done%saveEvery == 0 {
 			if err := r.Cache.Save(); err != nil {
@@ -207,37 +270,52 @@ func (r *Runner) fetchAll(ctx context.Context, todo []int, res *Result) error {
 		}
 		r.report(Progress{Stage: StageLegal, Message: "юрданные", Done: done, Total: len(todo)})
 	}
+	if fatal != nil {
+		return fatal
+	}
 	return ctx.Err()
 }
 
 // process обрабатывает одного продавца: берёт юрданные из кэша или с CDN,
 // при необходимости обогащает через реестр, сохраняет в кэш и отдаёт в OnRecord.
-// Запускается из воркеров, поэтому пишет только в потокобезопасные Cache/OnRecord.
-func (r *Runner) process(ctx context.Context, id int, res *Result) error {
+// Запускается из воркеров, поэтому пишет только в потокобезопасные Cache/OnRecord
+// и не меняет объекты, которые уже лежат в кэше.
+func (r *Runner) process(ctx context.Context, id int, res *Result) procResult {
+	pr := procResult{id: id}
 	s, ok := r.Cache.Get(id)
 	if !ok {
 		fetched, err := r.Client.Get(ctx, id)
 		if err != nil {
-			return err
+			pr.err = err
+			return pr
 		}
 		s = fetched
 	}
 
 	if s.Enrich == nil && r.wantEnrich(s) {
-		e, err := r.Enricher.Enrich(ctx, s.INN)
-		if err != nil {
-			if ctx.Err() != nil {
-				return err
-			}
-			slog.Warn("обогащение", "inn", s.INN, "err", err)
-		} else if e != nil {
-			s.Enrich = e
+		e, err := r.Enricher.Enrich(ctx, strings.TrimSpace(s.INN))
+		switch {
+		case err != nil && ctx.Err() != nil:
+			// Отмена посреди обогащения: юрданные уже есть, их сохраняем,
+			// обогащение повторится в следующем прогоне.
+			r.Cache.Put(s)
+			pr.err = ctx.Err()
+			return pr
+		case err != nil:
+			pr.enrichErr = err
+		case e != nil:
+			// Копия: объект из кэша читает Save в другой горутине.
+			cp := *s
+			cp.Enrich = e
+			s = &cp
 		}
 	}
 
 	r.Cache.Put(s)
 	if r.OnRecord != nil {
-		r.OnRecord(Record{Hit: res.Hits[id], Supplier: s})
+		if err := r.OnRecord(Record{Hit: res.Hits[id], Supplier: s}); err != nil {
+			pr.sinkErr = err
+		}
 	}
-	return nil
+	return pr
 }

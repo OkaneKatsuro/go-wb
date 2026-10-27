@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,11 +32,29 @@ func newRunner(t *testing.T, cdn http.HandlerFunc, src wb.Source) (*Runner, *sto
 	return &Runner{Source: src, Client: client, Cache: cache, Workers: 3}, cache
 }
 
+func TestRunValidatesConfig(t *testing.T) {
+	cache, _ := store.Load(filepath.Join(t.TempDir(), "c.json"))
+	for name, r := range map[string]*Runner{
+		"no source": {Cache: cache, Client: wb.NewSupplierClient(1)},
+		"no cache":  {Source: wb.IDList{1}, Client: wb.NewSupplierClient(1)},
+		"no client": {Source: wb.IDList{1}, Cache: cache},
+	} {
+		if res, err := r.Run(context.Background()); err == nil || res != nil {
+			t.Errorf("%s: res=%v err=%v, ожидалась ошибка конфигурации", name, res, err)
+		}
+	}
+	// Без Client, но только поиск — допустимо.
+	r := &Runner{Source: wb.IDList{1}, Cache: cache, SearchOnly: true}
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunFetchesAndWritesCSV(t *testing.T) {
 	cdn := func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/vol0/data/supplier-by-id/1.json":
-			w.Write([]byte(`{"supplierName":"ООО Ромашка","inn":"7700000000","ogrn":"1027700000000","legalAddress":"Москва"}`))
+			_, _ = w.Write([]byte(`{"supplierName":"ООО Ромашка","inn":"7700000000","ogrn":"1027700000000","legalAddress":"Москва"}`))
 		case "/vol0/data/supplier-by-id/2.json":
 			w.WriteHeader(http.StatusNotFound)
 		default:
@@ -84,8 +104,21 @@ func TestRunFetchesAndWritesCSV(t *testing.T) {
 	}
 }
 
+func TestRunCountsFailedSuppliers(t *testing.T) {
+	r, cache := newRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden) // не повторяется
+	}, wb.IDList{1, 2})
+	res, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("ошибки отдельных продавцов не должны ронять прогон: %v", err)
+	}
+	if res.Failed != 2 || cache.Len() != 0 {
+		t.Fatalf("Failed = %d, cache = %d, want 2 и пустой кэш", res.Failed, cache.Len())
+	}
+}
+
 func TestRunStopsOnCancel(t *testing.T) {
-	cdn := func(w http.ResponseWriter, r *http.Request) {
+	cdn := func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done() // никогда не отвечает; выходит, когда клиент отключается
 	}
 	ids := make(wb.IDList, 50)
@@ -113,7 +146,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 }
 
 func TestRunSearchOnly(t *testing.T) {
-	r, _ := newRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+	r, _ := newRunner(t, func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("CDN must not be called in search-only mode")
 	}, wb.IDList{3, 1})
 	r.SearchOnly = true
@@ -141,8 +174,8 @@ func (s *endlessSource) Collect(ctx context.Context, emit func(wb.SellerHit)) er
 }
 
 func TestRunStopsAtLimit(t *testing.T) {
-	cdn := func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"supplierName":"x"}`))
+	cdn := func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"supplierName":"x"}`))
 	}
 	src := &endlessSource{}
 	r, _ := newRunner(t, cdn, src)
@@ -157,32 +190,73 @@ func TestRunStopsAtLimit(t *testing.T) {
 	}
 }
 
+// pageSource отдаёт всю «страницу» одним махом, не глядя на ctx между emit —
+// так ведёт себя Searcher. Лишние id после лимита Runner должен отбросить.
+type pageSource []int
+
+func (p pageSource) Collect(ctx context.Context, emit func(wb.SellerHit)) error {
+	for _, id := range p {
+		emit(wb.SellerHit{SupplierID: id})
+	}
+	return ctx.Err()
+}
+
+func TestRunLimitIgnoresOverflowFromPage(t *testing.T) {
+	r, _ := newRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}, pageSource{1, 2, 3, 4, 5, 6, 7})
+	r.Limit = 3
+	res, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.IDs) != 3 {
+		t.Fatalf("IDs = %v, want ровно 3", res.IDs)
+	}
+}
+
 type fakeEnricher struct {
 	mu    sync.Mutex
 	calls []string
+	delay time.Duration
+	// reply строит ответ; nil — обычное обогащение «ООО <ИНН>».
+	reply func(inn string) (*wb.Enrichment, error)
 }
 
-func (f *fakeEnricher) Enrich(ctx context.Context, inn string) (*wb.Enrichment, error) {
+func (f *fakeEnricher) Enrich(_ context.Context, inn string) (*wb.Enrichment, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, inn)
 	f.mu.Unlock()
+	time.Sleep(f.delay)
+	if f.reply != nil {
+		return f.reply(inn)
+	}
 	return &wb.Enrichment{Kind: "ЮЛ", ShortName: "ООО " + inn, Source: "test"}, nil
 }
 
-// cdnWithINN отдаёт продавцам ИНН по id: 1 — юрлицо (10 цифр), 2 — ИП (12 цифр).
+func (f *fakeEnricher) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+// cdnWithINN отдаёт продавцам ИНН по id: 1 — юрлицо (10 цифр), 2 — ИП (12 цифр),
+// 3 — белорусский продавец без российского ИНН.
 func cdnWithINN(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/vol0/data/supplier-by-id/1.json":
-		w.Write([]byte(`{"supplierName":"ЮЛ","inn":"7700000001"}`))
+		_, _ = w.Write([]byte(`{"supplierName":"ЮЛ","inn":"7700000001"}`))
 	case "/vol0/data/supplier-by-id/2.json":
-		w.Write([]byte(`{"supplierName":"ИП","inn":"770000000002"}`))
+		_, _ = w.Write([]byte(`{"supplierName":"ИП","inn":"770000000002"}`))
+	case "/vol0/data/supplier-by-id/3.json":
+		_, _ = w.Write([]byte(`{"supplierName":"BY","inn":"","unp":"123456789"}`))
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
 }
 
 func TestEnrichSkipsIPByDefault(t *testing.T) {
-	r, cache := newRunner(t, cdnWithINN, wb.IDList{1, 2})
+	r, cache := newRunner(t, cdnWithINN, wb.IDList{1, 2, 3})
 	fe := &fakeEnricher{}
 	r.Enricher = fe
 	r.EnrichIP = false // ИП не трогаем
@@ -195,11 +269,15 @@ func TestEnrichSkipsIPByDefault(t *testing.T) {
 	}
 	s1, _ := cache.Get(1)
 	s2, _ := cache.Get(2)
+	s3, _ := cache.Get(3)
 	if s1.Enrich == nil || s1.Enrich.ShortName != "ООО 7700000001" {
 		t.Fatalf("юрлицо должно быть обогащено: %+v", s1.Enrich)
 	}
 	if s2.Enrich != nil {
 		t.Fatalf("ИП не должен обогащаться без EnrichIP: %+v", s2.Enrich)
+	}
+	if s3.Enrich != nil {
+		t.Fatalf("продавец без российского ИНН не обогащается: %+v", s3.Enrich)
 	}
 }
 
@@ -210,15 +288,144 @@ func TestEnrichIPAndOnRecord(t *testing.T) {
 
 	var mu sync.Mutex
 	got := map[int]bool{}
-	r.OnRecord = func(rec Record) {
+	r.OnRecord = func(rec Record) error {
 		mu.Lock()
 		got[rec.Supplier.ID] = rec.Supplier.Enrich != nil
 		mu.Unlock()
+		return nil
 	}
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 2 || !got[1] || !got[2] {
 		t.Fatalf("оба продавца должны пройти через OnRecord обогащёнными: %v", got)
+	}
+}
+
+// TestEnrichCachedSupplierDoesNotMutateCache: продавцы уже в кэше, обогащение
+// дописывается во втором прогоне. Save каждые 1 запись читает объекты кэша,
+// пока воркеры их обогащают, — под -race это ловит запись в объект на месте.
+func TestEnrichCachedSupplierDoesNotMutateCache(t *testing.T) {
+	const n = 12
+	ids := make(wb.IDList, n)
+	for i := range ids {
+		ids[i] = i + 1
+	}
+	r, cache := newRunner(t, func(_ http.ResponseWriter, r *http.Request) {
+		t.Errorf("всё в кэше, CDN не должен вызываться: %s", r.URL.Path)
+	}, ids)
+	for i := 1; i <= n; i++ {
+		cache.Put(&wb.Supplier{ID: i, INN: fmt.Sprintf("77%08d", i)})
+	}
+	before, _ := cache.Get(1)
+	r.Enricher = &fakeEnricher{delay: 2 * time.Millisecond}
+	r.SaveEvery = 1
+	r.Workers = 4
+
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if before.Enrich != nil {
+		t.Fatal("объект из кэша изменён на месте, а должен быть заменён копией")
+	}
+	after, _ := cache.Get(1)
+	if after.Enrich == nil || after == before {
+		t.Fatalf("в кэше должна лежать обогащённая копия: %+v", after)
+	}
+}
+
+func TestEnrichNotFoundIsCached(t *testing.T) {
+	r, cache := newRunner(t, cdnWithINN, wb.IDList{1})
+	fe := &fakeEnricher{reply: func(string) (*wb.Enrichment, error) {
+		return &wb.Enrichment{Source: "test", NotFound: true}, nil
+	}}
+	r.Enricher = fe
+
+	for range 2 {
+		if _, err := r.Run(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fe.count() != 1 {
+		t.Fatalf("реестр спросили %d раз, а «не найдено» должно кэшироваться", fe.count())
+	}
+	if s, _ := cache.Get(1); s.Enrich == nil || !s.Enrich.NotFound {
+		t.Fatalf("в кэше должна быть пометка NotFound: %+v", s.Enrich)
+	}
+}
+
+func TestEnrichFailureIsCountedAndRetriedNextRun(t *testing.T) {
+	r, cache := newRunner(t, cdnWithINN, wb.IDList{1})
+	fe := &fakeEnricher{reply: func(string) (*wb.Enrichment, error) { return nil, errors.New("api down") }}
+	r.Enricher = fe
+
+	res, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("сбой обогащения не роняет прогон: %v", err)
+	}
+	if res.EnrichFailed != 1 || res.Failed != 0 {
+		t.Fatalf("EnrichFailed=%d Failed=%d, want 1 и 0", res.EnrichFailed, res.Failed)
+	}
+	if s, ok := cache.Get(1); !ok || s.Enrich != nil {
+		t.Fatalf("юрданные сохраняются, обогащение остаётся пустым: ok=%v %+v", ok, s)
+	}
+	// Второй прогон повторяет попытку, потому что в кэше нет пометки.
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fe.count() != 2 {
+		t.Fatalf("calls = %d, want 2", fe.count())
+	}
+}
+
+func TestEnrichUnavailableStopsRun(t *testing.T) {
+	var cdnCalls atomic.Int32
+	ids := make(wb.IDList, 200)
+	for i := range ids {
+		ids[i] = i + 1
+	}
+	r, cache := newRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+		cdnCalls.Add(1)
+		_, _ = w.Write([]byte(`{"inn":"7700000001"}`))
+	}, ids)
+	errKey := fmt.Errorf("ключ отклонён: %w", wb.ErrEnrichUnavailable)
+	fe := &fakeEnricher{reply: func(string) (*wb.Enrichment, error) { return nil, errKey }}
+	r.Enricher = fe
+
+	res, err := r.Run(context.Background())
+	if !errors.Is(err, wb.ErrEnrichUnavailable) {
+		t.Fatalf("err = %v, want ErrEnrichUnavailable", err)
+	}
+	if n := cdnCalls.Load(); n >= 200 {
+		t.Fatalf("после отклонённого ключа прогон должен остановиться, CDN вызван %d раз", n)
+	}
+	if res == nil || len(res.IDs) != 200 {
+		t.Fatal("частичный результат должен сохраниться")
+	}
+	// Юрданные продавца, на котором споткнулось обогащение, в кэше есть.
+	if cache.Len() == 0 {
+		t.Fatal("полученные юрданные должны остаться в кэше")
+	}
+}
+
+func TestOnRecordErrorStopsRun(t *testing.T) {
+	var cdnCalls atomic.Int32
+	ids := make(wb.IDList, 200)
+	for i := range ids {
+		ids[i] = i + 1
+	}
+	r, _ := newRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+		cdnCalls.Add(1)
+		_, _ = w.Write([]byte(`{}`))
+	}, ids)
+	errPipe := errors.New("broken pipe")
+	r.OnRecord = func(Record) error { return errPipe }
+
+	_, err := r.Run(context.Background())
+	if !errors.Is(err, errPipe) {
+		t.Fatalf("err = %v, want errPipe", err)
+	}
+	if n := cdnCalls.Load(); n >= 200 {
+		t.Fatalf("после ошибки вывода прогон должен остановиться, а CDN вызван %d раз", n)
 	}
 }

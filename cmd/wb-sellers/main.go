@@ -2,7 +2,7 @@
 //
 // Шаг 1: найти supplierId через Source (файл с id, поиск WB по запросам).
 // Шаг 2: получить юрданные по каждому supplierId из публичного CDN.
-// Результат: CSV.
+// Результат: CSV целиком в конце или NDJSON построчно по мере готовности.
 package main
 
 import (
@@ -23,6 +23,13 @@ import (
 	"github.com/OkaneKatsuro/go-wb/internal/wb"
 )
 
+// Коды выхода: 1 — ошибка, 2 — неверные флаги, 130 — остановлено сигналом (как в shell).
+const (
+	exitErr      = 1
+	exitUsage    = 2
+	exitCanceled = 130
+)
+
 // config хранит все флаги. flag.StringVar пишет прямо в поле,
 // поэтому дальше программа работает с обычными значениями, а не с указателями.
 type config struct {
@@ -33,11 +40,17 @@ type config struct {
 }
 
 func main() {
+	os.Exit(realMain())
+}
+
+// realMain возвращает код выхода, чтобы os.Exit вызывался один раз снаружи
+// и все defer (в том числе остановка обработчика сигналов) успели отработать.
+func realMain() int {
 	var c config
 	flag.StringVar(&c.queries, "queries", "", "файл с поисковыми запросами, один на строку")
 	flag.StringVar(&c.ids, "ids", "", "файл с supplierId или ссылками на продавца, один на строку")
 	flag.IntVar(&c.pages, "pages", 10, "максимум страниц на запрос (по 100 товаров)")
-	flag.StringVar(&c.out, "out", "out/sellers.csv", "итоговый CSV")
+	flag.StringVar(&c.out, "out", "", "итоговый файл: out/sellers.csv или out/sellers.ndjson по формату; «-» = stdout")
 	flag.StringVar(&c.idsOut, "ids-out", "out/supplier_ids.txt", "куда записать найденные supplierId (пусто = не писать)")
 	flag.BoolVar(&c.searchOnly, "search-only", false, "только поиск, без юрданных")
 	flag.StringVar(&c.profile, "profile", "windows-chrome152.json", "профиль site-mimic для поиска")
@@ -56,29 +69,57 @@ func main() {
 	flag.Parse()
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
-	if c.queries == "" && c.ids == "" {
-		fmt.Fprintln(os.Stderr, "нужен -queries или -ids")
+	if err := c.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		flag.Usage()
-		os.Exit(2)
+		return exitUsage
 	}
 
 	// Ctrl+C или SIGTERM отменяют ctx; всё, что ниже, проверяет его и останавливается.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Без этого запись в закрытый пайп (`-out - | head`) убивает процесс SIGPIPE
+	// раньше, чем NDJSONWriter вернёт ошибку и Runner сохранит кэш. С Ignore
+	// запись возвращает EPIPE, и прогон завершается штатно: кэш сохранён, код 1.
+	signal.Ignore(syscall.SIGPIPE)
 
 	if err := run(ctx, c); err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Warn("остановлено пользователем, собранное сохранено")
-			os.Exit(130)
+			return exitCanceled
 		}
 		slog.Error(err.Error())
-		os.Exit(1)
+		return exitErr
 	}
+	return 0
+}
+
+// validate проверяет флаги до любой работы, чтобы ошибка в них не всплыла
+// после минуты поиска. Здесь же подставляется имя выходного файла по формату.
+func (c *config) validate() error {
+	if c.queries == "" && c.ids == "" {
+		return errors.New("нужен -queries или -ids")
+	}
+	switch c.format {
+	case "csv", "ndjson":
+	default:
+		return fmt.Errorf("неизвестный -format %q (csv или ndjson)", c.format)
+	}
+	if c.out == "" {
+		c.out = "out/sellers." + c.format
+	}
+	if c.enrich && c.ofdataKey == "" {
+		c.ofdataKey = os.Getenv("OFDATA_KEY")
+	}
+	if c.enrich && c.ofdataKey == "" {
+		return errors.New("для -enrich нужен ключ OFData: переменная OFDATA_KEY или флаг -ofdata-key")
+	}
+	return nil
 }
 
 func run(ctx context.Context, c config) error {
 	for _, p := range []string{c.out, c.cache, c.idsOut, c.dump} {
-		if p != "" {
+		if p != "" && p != "-" {
 			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 				return err
 			}
@@ -108,10 +149,6 @@ func run(ctx context.Context, c config) error {
 		sources = append(sources, wb.QuerySearch{Searcher: s, Queries: queries, Pages: c.pages})
 	}
 
-	if c.format != "csv" && c.format != "ndjson" {
-		return fmt.Errorf("неизвестный -format %q (csv или ndjson)", c.format)
-	}
-
 	cache, err := store.Load(c.cache)
 	if err != nil {
 		return err
@@ -126,13 +163,9 @@ func run(ctx context.Context, c config) error {
 		OnProgress: cliProgress(),
 	}
 
-	// Обогащение из OFData, если включено.
+	// Обогащение из OFData, если включено. Ключ проверен в validate.
 	if c.enrich {
-		key := c.ofdataKey
-		if key == "" {
-			key = os.Getenv("OFDATA_KEY")
-		}
-		en, err := ofdata.New(key, c.ofdataRps)
+		en, err := ofdata.New(c.ofdataKey, c.ofdataRps)
 		if err != nil {
 			return err
 		}
@@ -142,7 +175,7 @@ func run(ctx context.Context, c config) error {
 
 	// NDJSON отдаётся потоком по мере готовности продавцов.
 	var ndw *collect.NDJSONWriter
-	var closeOut func() error
+	closeOut := func() error { return nil }
 	if c.format == "ndjson" && !c.searchOnly {
 		w, closeFn, err := openOut(c.out)
 		if err != nil {
@@ -154,8 +187,9 @@ func run(ctx context.Context, c config) error {
 	}
 
 	res, err := runner.Run(ctx)
-	if closeOut != nil {
-		closeOut()
+	// Ошибка закрытия файла — это потерянные данные, её нельзя проглотить.
+	if cerr := closeOut(); cerr != nil && err == nil {
+		err = fmt.Errorf("закрытие %s: %w", c.out, cerr)
 	}
 
 	// Частичный результат стоит записать, даже когда err != nil.
@@ -173,20 +207,21 @@ func run(ctx context.Context, c config) error {
 		return nil
 	}
 	if c.format == "ndjson" {
-		slog.Info("готово", "rows", ndw.Count(), "format", "ndjson", "failed", res.Failed)
+		slog.Info("готово", "rows", ndw.Count(), "format", "ndjson", "failed", res.Failed, "enrichFailed", res.EnrichFailed)
 		return nil
 	}
 	n, err := writeCSVOut(c.out, res, cache)
 	if err != nil {
 		return err
 	}
-	slog.Info("готово", "rows", n, "file", c.out, "failed", res.Failed)
+	slog.Info("готово", "rows", n, "file", c.out, "failed", res.Failed, "enrichFailed", res.EnrichFailed)
 	return nil
 }
 
-// openOut возвращает writer для вывода: stdout при "-" или пустом пути, иначе файл.
+// openOut возвращает writer для вывода: stdout при "-", иначе файл.
+// Для stdout закрывать нечего, поэтому closer — пустая функция.
 func openOut(path string) (io.Writer, func() error, error) {
-	if path == "" || path == "-" {
+	if path == "-" {
 		return os.Stdout, func() error { return nil }, nil
 	}
 	f, err := os.Create(path)
@@ -198,7 +233,7 @@ func openOut(path string) (io.Writer, func() error, error) {
 
 // writeCSVOut пишет CSV в файл или в stdout (при "-").
 func writeCSVOut(path string, res *collect.Result, cache *store.Cache) (int, error) {
-	if path == "" || path == "-" {
+	if path == "-" {
 		return collect.WriteCSV(os.Stdout, res, cache)
 	}
 	return collect.WriteCSVFile(path, res, cache)
