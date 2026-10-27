@@ -1,0 +1,4 @@
+out/
+*.csv
+*.tmp
+.zed/
