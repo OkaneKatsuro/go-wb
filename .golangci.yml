@@ -1,0 +1,57 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose    # незакрытое resp.Body
+    - copyloopvar  # лишние копии переменной цикла (Go ≥ 1.22)
+    - errorlint    # сравнение ошибок без errors.Is/As, %v вместо %w
+    - gocritic     # набор проверок стиля и подозрительных конструкций
+    - gosec        # базовые проверки безопасности
+    - misspell     # опечатки в английских словах
+    - noctx        # HTTP-запросы без контекста
+    - nolintlint   # //nolint без причины или линтера
+    - prealloc     # слайсы, которым известна ёмкость
+    - revive       # замена golint
+    - unconvert    # лишние преобразования типов
+    - unparam      # неиспользуемые параметры
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gosec:
+      excludes:
+        - G104 # дублирует errcheck
+        - G115 # int → другие int: все значения здесь малы
+        - G301 # каталоги 0o755 и файлы 0o644: это выходные данные CLI, не секреты
+        - G302
+        - G306
+        - G304 # CLI по определению читает файлы по пути из флага
+        - G404 # math/rand для джиттера пауз между запросами, не для криптографии
+    revive:
+      rules:
+        - name: exported
+          disabled: true # пакет internal, публичный API не нужен
+        - name: package-comments
+          disabled: true
+        - name: unused-parameter
+          disabled: true # мешает сигнатурам http.HandlerFunc
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/OkaneKatsuro/go-wb

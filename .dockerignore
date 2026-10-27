@@ -1,5 +1,11 @@
+.git/
+.github/
+.zed/
 out/
 *.csv
-.git/
+*.txt
+*.md
+*.tmp
 Dockerfile
 .dockerignore
+.golangci.yml
