@@ -45,17 +45,19 @@
       {{if .HasSearch}}<label><input type="radio" name="mode" value="queries"> Поисковые запросы</label>{{end}}
     </div>
     <div style="margin-top:16px">
-      <label for="input">По одному на строку, строки с # игнорируются</label>
+      <label for="input">По одному на строку, строки с # игнорируются. Можно вставить CSV из wb-search целиком: возьмётся колонка supplier_id</label>
       <textarea id="input" name="input" placeholder="1&#10;https://www.wildberries.ru/seller/12345"></textarea>
     </div>
-    {{if .HasSearch}}
-    <div class="row" id="pagesRow" hidden>
-      <label for="pages" style="margin:0">Страниц на запрос</label>
-      <input type="number" id="pages" name="pages" value="3" min="1" max="50" style="width:90px">
-      <label for="limit" style="margin:0 0 0 12px">Хватит продавцов (0 = все)</label>
+    <div class="row">
+      <label for="limit" style="margin:0">Хватит продавцов (0 = все)</label>
       <input type="number" id="limit" name="limit" value="0" min="0" style="width:90px">
+      {{if .HasSearch}}
+      <span id="pagesRow" hidden>
+        <label for="pages" style="margin:0 0 0 12px;display:inline">Страниц на запрос</label>
+        <input type="number" id="pages" name="pages" value="3" min="1" max="50" style="width:90px">
+      </span>
+      {{end}}
     </div>
-    {{end}}
     <div class="row">
       <button type="submit" id="start">Запустить</button>
       <button type="button" class="secondary" id="cancel" disabled>Остановить</button>

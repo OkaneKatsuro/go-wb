@@ -23,6 +23,7 @@ type ndjsonRecord struct {
 	Deactivated  bool           `json:"deactivated"`
 	NotFound     bool           `json:"notFound,omitempty"`
 	Query        string         `json:"sourceQuery,omitempty"`
+	SellerType   string         `json:"sellerType,omitempty"`
 	Enrich       *wb.Enrichment `json:"enrich,omitempty"`
 }
 
@@ -39,7 +40,7 @@ func flatten(rec Record) ndjsonRecord {
 		SupplierID: s.ID, Name: name, FullName: s.FullName, INN: s.INN,
 		OGRN: s.OGRN, KPP: s.KPP, LegalAddress: s.LegalAddress, Trademark: s.Trademark,
 		Rating: rec.Hit.SupplierRating, Deactivated: s.Deactivated, NotFound: s.NotFound,
-		Query: rec.Hit.Query, Enrich: s.Enrich,
+		Query: rec.Hit.Query, SellerType: s.SellerType, Enrich: s.Enrich,
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 
@@ -40,6 +41,18 @@ func Load(path string) (*Cache, error) {
 	}
 	if err := json.Unmarshal(b, &c.m); err != nil {
 		return nil, fmt.Errorf("кэш %s: %w", path, err)
+	}
+	// Пометки NotFound без даты оставила старая версия с неверным путём CDN
+	// (vol{id/1000}): почти все они ложные. Убираем, чтобы продавцов запросили заново.
+	dropped := 0
+	for id, s := range c.m {
+		if s.NotFound && s.FetchedAt.IsZero() {
+			delete(c.m, id)
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		slog.Info("кэш: удалены устаревшие пометки notFound без даты", "count", dropped)
 	}
 	return c, nil
 }

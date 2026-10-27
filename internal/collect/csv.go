@@ -15,6 +15,7 @@ var (
 	baseHeader = []string{
 		"supplierId", "supplierName", "supplierFullName", "inn", "ogrn", "kpp",
 		"legalAddress", "trademark", "taxpayerCode", "supplierRating", "deactivated", "notFound", "source_query",
+		"sellerType",
 	}
 	// колонки обогащения (OFData), пустые без -enrich; ширина строки от них не зависит
 	enrichHeader = []string{
@@ -128,7 +129,7 @@ func csvRow(id int, h wb.SellerHit, cache *store.Cache) []string {
 	row = append(row,
 		strconv.Itoa(id), name, s.FullName, s.INN, s.OGRN, s.KPP,
 		s.LegalAddress, s.Trademark, s.TaxpayerCode, rating,
-		strconv.FormatBool(s.Deactivated), strconv.FormatBool(s.NotFound), h.Query,
+		strconv.FormatBool(s.Deactivated), strconv.FormatBool(s.NotFound), h.Query, s.SellerType,
 	)
 	return append(row, enrichColumns(s.Enrich)...)
 }

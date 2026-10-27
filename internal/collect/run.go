@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/OkaneKatsuro/go-wb/internal/store"
 	"github.com/OkaneKatsuro/go-wb/internal/wb"
@@ -72,6 +73,9 @@ type Runner struct {
 	Limit      int      // остановить сбор, набрав столько уникальных продавцов, 0 = без лимита
 	Enricher   Enricher // nil = без обогащения
 	EnrichIP   bool     // обогащать ли ИП (ИНН из 12 цифр); для юрлиц обогащение всегда
+	// NotFoundTTL — через сколько перепроверять продавца, которого CDN не знал
+	// (он мог появиться позже), 0 = 7 дней.
+	NotFoundTTL time.Duration
 
 	// OnProgress необязателен. Всегда вызывается из той горутины, что вызвала Run.
 	OnProgress func(Progress)
@@ -94,6 +98,15 @@ func (r *Runner) validate() error {
 		return errors.New("collect: не задан Client")
 	}
 	return nil
+}
+
+// stale сообщает, что пометка NotFound отлежала свой срок и её пора перепроверить.
+func (r *Runner) stale(s *wb.Supplier) bool {
+	ttl := r.NotFoundTTL
+	if ttl <= 0 {
+		ttl = 7 * 24 * time.Hour
+	}
+	return s.NotFound && time.Since(s.FetchedAt) > ttl
 }
 
 // wantEnrich сообщает, нужно ли обогащать этого продавца и можно ли (по ИНН).
@@ -170,7 +183,7 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	var todo []int
 	for _, id := range res.IDs {
 		s, ok := r.Cache.Get(id)
-		need := !ok || (s.Enrich == nil && r.wantEnrich(s))
+		need := !ok || r.stale(s) || (s.Enrich == nil && r.wantEnrich(s))
 		if need || streaming {
 			todo = append(todo, id)
 		}
@@ -287,7 +300,7 @@ func (r *Runner) fetchAll(ctx context.Context, todo []int, res *Result) error {
 func (r *Runner) process(ctx context.Context, id int, res *Result) procResult {
 	pr := procResult{id: id}
 	s, ok := r.Cache.Get(id)
-	if !ok {
+	if !ok || r.stale(s) {
 		fetched, err := r.Client.Get(ctx, id)
 		if err != nil {
 			pr.err = err

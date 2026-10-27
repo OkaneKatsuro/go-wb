@@ -395,3 +395,19 @@ func TestDownloadAfterCancelKeepsPartialResult(t *testing.T) {
 		t.Fatalf("частичный CSV после отмены: %d\n%s", code, csv)
 	}
 }
+
+func TestStartAcceptsSearchCSVWithLimit(t *testing.T) {
+	ts, _ := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"supplierName":"x"}`))
+	})
+	csvIn := "\xEF\xBB\xBFquery,id,name,supplier_id\n" +
+		"куртка,1,\"a, b\",101\nкуртка,2,c,102\nкуртка,3,d,101\nкуртка,4,e,103\n"
+	code, body := post(t, ts.URL+"/api/start", url.Values{"mode": {"ids"}, "input": {csvIn}, "limit": {"2"}})
+	if code != 202 {
+		t.Fatalf("start: %d %s", code, body)
+	}
+	st := waitFinished(t, ts.URL)
+	if st.Stage != "done" || st.Sellers != 2 || st.Rows != 2 {
+		t.Fatalf("CSV с лимитом 2: %+v", st)
+	}
+}

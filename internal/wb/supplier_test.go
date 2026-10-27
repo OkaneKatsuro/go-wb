@@ -24,10 +24,12 @@ func newTestClient(t *testing.T, h http.HandlerFunc) *SupplierClient {
 
 func TestSupplierURL(t *testing.T) {
 	c := &SupplierClient{BaseURL: "https://cdn"}
+	// Каталог всегда vol0: формула vol{id/1000} давала 404 всем id от 1000.
 	tests := map[int]string{
-		1:      "https://cdn/vol0/data/supplier-by-id/1.json",
-		999:    "https://cdn/vol0/data/supplier-by-id/999.json",
-		123456: "https://cdn/vol123/data/supplier-by-id/123456.json",
+		1:         "https://cdn/vol0/data/supplier-by-id/1.json",
+		999:       "https://cdn/vol0/data/supplier-by-id/999.json",
+		123456:    "https://cdn/vol0/data/supplier-by-id/123456.json",
+		250057880: "https://cdn/vol0/data/supplier-by-id/250057880.json",
 	}
 	for id, want := range tests {
 		if got := c.url(id); got != want {
@@ -60,7 +62,7 @@ func TestValidINN(t *testing.T) {
 func TestGetRetriesOn429(t *testing.T) {
 	var calls atomic.Int32
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/vol123/data/supplier-by-id/123456.json" {
+		if r.URL.Path != "/vol0/data/supplier-by-id/123456.json" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 		if calls.Add(1) == 1 {
@@ -81,6 +83,9 @@ func TestGetRetriesOn429(t *testing.T) {
 	}
 	if s.OGRN != "300000000000000" {
 		t.Fatalf("OGRN should fall back to OGRNIP, got %q", s.OGRN)
+	}
+	if s.FetchedAt.IsZero() {
+		t.Fatal("FetchedAt должен быть проставлен")
 	}
 }
 
@@ -107,8 +112,8 @@ func TestGetNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s.NotFound || s.ID != 5 {
-		t.Fatalf("want NotFound stub for id 5, got %+v", s)
+	if !s.NotFound || s.ID != 5 || s.FetchedAt.IsZero() {
+		t.Fatalf("want NotFound stub for id 5 with FetchedAt, got %+v", s)
 	}
 }
 

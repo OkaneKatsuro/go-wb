@@ -19,10 +19,11 @@ const DefaultBaseURL = "https://static-basket-01.wbbasket.ru"
 const maxSupplierBody = 1 << 20
 
 // Supplier — юридические данные одного продавца WB в том виде, в каком их отдаёт CDN:
-// {BaseURL}/vol{id/1000}/data/supplier-by-id/{id}.json
+// {BaseURL}/vol0/data/supplier-by-id/{id}.json
 type Supplier struct {
 	ID           int    `json:"supplierId"`
 	Name         string `json:"supplierName"`
+	SellerType   string `json:"sellerType,omitempty"` // напр. "C2C": физлицо, юрданных нет
 	FullName     string `json:"supplierFullName"`
 	INN          string `json:"inn"`
 	OGRN         string `json:"ogrn"`
@@ -37,6 +38,9 @@ type Supplier struct {
 	Deactivated  bool   `json:"deactivated"`
 	// NotFound мы ставим сами, когда CDN отвечает 404, чтобы не запрашивать этот id снова.
 	NotFound bool `json:"notFound,omitempty"`
+	// FetchedAt — когда запись получена с CDN. По ней Runner решает, не пора ли
+	// перепроверить NotFound: продавец мог появиться позже.
+	FetchedAt time.Time `json:"fetchedAt,omitzero"`
 	// Enrich — обогащение из внешнего реестра (OFData), nil пока не запрашивали.
 	// Хранится прямо в Supplier, поэтому кэш сохраняет его между запусками.
 	// Объект в кэше после Put не меняется: кто хочет дописать Enrich, делает копию.
@@ -114,8 +118,11 @@ func NewSupplierClient(rps int) *SupplierClient {
 	}
 }
 
+// url строит адрес записи. Каталог всегда vol0, независимо от id: проверено на
+// продавцах от 276 до 350 млн. Формула vol{id/1000} работала только для id
+// меньше 1000, а всем остальным молча ставила NotFound.
 func (c *SupplierClient) url(id int) string {
-	return fmt.Sprintf("%s/vol%d/data/supplier-by-id/%d.json", c.BaseURL, id/1000, id)
+	return fmt.Sprintf("%s/vol0/data/supplier-by-id/%d.json", c.BaseURL, id)
 }
 
 // Get возвращает продавца или заглушку NotFound при 404.
@@ -169,13 +176,14 @@ func (c *SupplierClient) fetch(ctx context.Context, id int) (*Supplier, bool, er
 			return nil, false, fmt.Errorf("разбор JSON: %w (начало: %.200s)", err, body)
 		}
 		s.ID = id
+		s.FetchedAt = time.Now()
 		s.INN = strings.TrimSpace(s.INN) // ValidINN и реестр ждут ровно цифры
 		if s.OGRN == "" {
 			s.OGRN = s.OGRNIP // у ИП номер лежит в отдельном поле
 		}
 		return s, false, nil
 	case http.StatusNotFound:
-		return &Supplier{ID: id, NotFound: true}, false, nil
+		return &Supplier{ID: id, NotFound: true, FetchedAt: time.Now()}, false, nil
 	case http.StatusTooManyRequests:
 		return nil, true, fmt.Errorf("статус %d", resp.StatusCode)
 	default:

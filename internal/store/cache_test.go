@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/OkaneKatsuro/go-wb/internal/wb"
 )
@@ -26,7 +27,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Put(&wb.Supplier{ID: 7, Name: "ИП Иванов", OGRN: "3", NotFound: false})
-	c.Put(&wb.Supplier{ID: 8, NotFound: true})
+	c.Put(&wb.Supplier{ID: 8, NotFound: true, FetchedAt: time.Now()}) // без даты Load счёл бы пометку ложной
 	if err := c.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -93,5 +94,30 @@ func TestLoadCorruptFileIsError(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("повреждённый кэш должен давать ошибку, а не пустой кэш")
+	}
+}
+
+// Старая версия ставила NotFound всем id от 1000 из-за неверного пути CDN.
+// Такие пометки без даты при загрузке выбрасываются, остальное остаётся.
+func TestLoadDropsLegacyNotFound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.json")
+	legacy := `{"1":{"supplierId":1,"supplierName":"есть"},
+	 "2":{"supplierId":2,"notFound":true},
+	 "3":{"supplierId":3,"notFound":true,"fetchedAt":"2026-10-27T10:00:00Z"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Get(2); ok {
+		t.Fatal("ложный NotFound без даты должен быть удалён")
+	}
+	if s, ok := c.Get(3); !ok || !s.NotFound {
+		t.Fatal("NotFound с датой остаётся")
+	}
+	if _, ok := c.Get(1); !ok || c.Len() != 2 {
+		t.Fatalf("обычные записи остаются, Len = %d", c.Len())
 	}
 }

@@ -347,7 +347,8 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	lines, err := wb.ParseLines(strings.NewReader(r.FormValue("input")))
+	input := r.FormValue("input")
+	lines, err := wb.ParseLines(strings.NewReader(input))
 	if err != nil {
 		http.Error(w, "ввод не разобран: "+err.Error(), http.StatusBadRequest)
 		return
@@ -368,12 +369,17 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	var src wb.Source
 	switch r.FormValue("mode") {
 	case "ids":
-		ids := wb.ParseIDs(lines)
-		if len(ids) == 0 {
+		// Принимает и список id, и CSV из wb-search с колонкой supplier_id.
+		hits, err := wb.ExtractHits(strings.NewReader(input))
+		if err != nil {
+			http.Error(w, "ввод не разобран: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(hits) == 0 {
 			http.Error(w, "не нашёл ни одного supplierId", http.StatusBadRequest)
 			return
 		}
-		src = wb.IDList(ids)
+		src = wb.HitList(hits)
 	case "queries":
 		if s.cfg.NewSearch == nil {
 			http.Error(w, "режим поиска выключен", http.StatusBadRequest)

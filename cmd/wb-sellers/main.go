@@ -48,7 +48,7 @@ func main() {
 func realMain() int {
 	var c config
 	flag.StringVar(&c.queries, "queries", "", "файл с поисковыми запросами, один на строку")
-	flag.StringVar(&c.ids, "ids", "", "файл с supplierId или ссылками на продавца, один на строку")
+	flag.StringVar(&c.ids, "ids", "", "файл с supplierId: по одному id или ссылке на строку, либо CSV с колонкой supplier_id (вывод wb-search)")
 	flag.IntVar(&c.pages, "pages", 10, "максимум страниц на запрос (по 100 товаров)")
 	flag.StringVar(&c.out, "out", "", "итоговый файл: out/sellers.csv или out/sellers.ndjson по формату; «-» = stdout")
 	flag.StringVar(&c.idsOut, "ids-out", "out/supplier_ids.txt", "куда записать найденные supplierId (пусто = не писать)")
@@ -130,11 +130,14 @@ func run(ctx context.Context, c config) error {
 	// тогда поиск, остановленный ErrChallenge, не сможет потерять эти id.
 	var sources wb.Multi
 	if c.ids != "" {
-		lines, err := wb.ReadLines(c.ids)
+		hits, err := wb.ReadHits(c.ids)
 		if err != nil {
 			return err
 		}
-		sources = append(sources, wb.IDList(wb.ParseIDs(lines)))
+		if len(hits) == 0 {
+			return fmt.Errorf("в %s не нашлось ни одного supplierId", c.ids)
+		}
+		sources = append(sources, wb.HitList(hits))
 	}
 	if c.queries != "" {
 		queries, err := wb.ReadLines(c.queries)

@@ -138,6 +138,27 @@ func TestRunSkippedQueriesBecomeWarning(t *testing.T) {
 	}
 }
 
+func TestStaleNotFoundIsRefetched(t *testing.T) {
+	var calls atomic.Int32
+	r, cache := newRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"supplierName":"появился"}`))
+	}, wb.IDList{1, 2})
+	cache.Put(&wb.Supplier{ID: 1, NotFound: true, FetchedAt: time.Now().Add(-48 * time.Hour)}) // отлежал
+	cache.Put(&wb.Supplier{ID: 2, NotFound: true, FetchedAt: time.Now()})                      // свежий
+	r.NotFoundTTL = 24 * time.Hour
+
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("перепроверить нужно только отлежавший NotFound, CDN вызван %d раз", calls.Load())
+	}
+	if s, _ := cache.Get(1); s.NotFound || s.Name != "появился" {
+		t.Fatalf("id 1 должен обновиться: %+v", s)
+	}
+}
+
 func TestRunStopsOnCancel(t *testing.T) {
 	cdn := func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done() // никогда не отвечает; выходит, когда клиент отключается
