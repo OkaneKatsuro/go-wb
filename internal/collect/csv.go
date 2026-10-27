@@ -14,6 +14,9 @@ import (
 var csvHeader = []string{
 	"supplierId", "supplierName", "supplierFullName", "inn", "ogrn", "kpp",
 	"legalAddress", "trademark", "taxpayerCode", "supplierRating", "deactivated", "notFound", "source_query",
+	// колонки обогащения (OFData), пустые без -enrich
+	"of_kind", "of_shortName", "of_fullName", "of_ogrn", "of_status", "of_regDate",
+	"of_address", "of_okvedCode", "of_okvedName", "of_director",
 }
 
 // csvSafe защищает от CSV-инъекции: имя продавца приходит от WB, и если ячейка
@@ -59,6 +62,7 @@ func WriteCSV(w io.Writer, res *Result, cache *store.Cache) (int, error) {
 			s.LegalAddress, s.Trademark, s.TaxpayerCode, rating,
 			strconv.FormatBool(s.Deactivated), strconv.FormatBool(s.NotFound), h.Query,
 		}
+		row = append(row, enrichColumns(s.Enrich)...)
 		for i := range row {
 			row[i] = csvSafe(row[i])
 		}
@@ -69,6 +73,18 @@ func WriteCSV(w io.Writer, res *Result, cache *store.Cache) (int, error) {
 	}
 	cw.Flush()
 	return n, cw.Error()
+}
+
+// enrichColumns отдаёт значения колонок обогащения; при nil — пустые строки,
+// чтобы ширина строки CSV не зависела от того, обогащён продавец или нет.
+func enrichColumns(e *wb.Enrichment) []string {
+	if e == nil {
+		return make([]string, 10)
+	}
+	return []string{
+		e.Kind, e.ShortName, e.FullName, e.OGRN, e.Status, e.RegDate,
+		e.Address, e.OkvedCode, e.OkvedName, e.Director,
+	}
 }
 
 // WriteCSVFile — это WriteCSV в заново созданный файл.

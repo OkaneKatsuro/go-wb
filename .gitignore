@@ -8,3 +8,7 @@ out/
 cmd/wb-search/
 cmd/har-sellers/
 cmd/wb-test/
+
+# собранные бинарники
+/wb-sellers
+/wb-server

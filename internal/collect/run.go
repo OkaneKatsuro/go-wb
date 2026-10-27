@@ -39,18 +39,42 @@ type Result struct {
 	Warning string // нефатальная проблема, напр. поиск остановлен ErrChallenge
 }
 
+// Enricher обогащает продавца по ИНН данными из внешнего реестра.
+// Возвращает (nil, nil), если запись не найдена. Реализация — ofdata.Client.
+type Enricher interface {
+	Enrich(ctx context.Context, inn string) (*wb.Enrichment, error)
+}
+
+// Record — готовые данные по одному продавцу. OnRecord вызывается по мере
+// завершения каждого продавца, поэтому порядок — порядок завершения, не отсортированный.
+type Record struct {
+	Hit      wb.SellerHit
+	Supplier *wb.Supplier // юрданные с CDN плюс Supplier.Enrich, если включено обогащение
+}
+
 type Runner struct {
 	Source  wb.Source
 	Client  *wb.SupplierClient
 	Cache   *store.Cache
 	Workers int // одновременные запросы к CDN; клиент ограничивает их скорость глобально
 
-	SearchOnly bool // остановиться после этапа Source
-	SaveEvery  int  // сохранять кэш каждые N полученных продавцов, 0 = 200
-	Limit      int  // остановить сбор, набрав столько уникальных продавцов, 0 = без лимита
+	SearchOnly bool     // остановиться после этапа Source
+	SaveEvery  int      // сохранять кэш каждые N полученных продавцов, 0 = 200
+	Limit      int      // остановить сбор, набрав столько уникальных продавцов, 0 = без лимита
+	Enricher   Enricher // nil = без обогащения
+	EnrichIP   bool     // обогащать ли ИП (ИНН из 12 цифр); для юрлиц обогащение всегда
 
 	// OnProgress необязателен. Всегда вызывается из той горутины, что вызвала Run.
 	OnProgress func(Progress)
+	// OnRecord необязателен. Вызывается из воркеров по мере готовности продавца,
+	// поэтому должен быть потокобезопасным. Для потокового NDJSON-вывода.
+	OnRecord func(Record)
+}
+
+// wantEnrich сообщает, нужно ли обогащать этого продавца и можно ли (по ИНН).
+func (r *Runner) wantEnrich(s *wb.Supplier) bool {
+	return r.Enricher != nil && s != nil && !s.NotFound && s.INN != "" &&
+		(!wb.IsIP(s.INN) || r.EnrichIP)
 }
 
 func (r *Runner) report(p Progress) {
@@ -98,13 +122,20 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 		return res, nil
 	}
 
+	// Работа нужна, если нет юрданных в кэше, либо данные есть, но продавца
+	// ещё не обогащали, а обогащение включено и применимо. В режиме потока
+	// (OnRecord задан) через воркеры проходят все продавцы, чтобы каждый был
+	// отдан ровно один раз; уже готовые обрабатываются мгновенно, без сети.
+	streaming := r.OnRecord != nil
 	var todo []int
 	for _, id := range res.IDs {
-		if _, ok := r.Cache.Get(id); !ok {
+		s, ok := r.Cache.Get(id)
+		need := !ok || (s.Enrich == nil && r.wantEnrich(s))
+		if need || streaming {
 			todo = append(todo, id)
 		}
 	}
-	slog.Info("юрданные", "total", len(res.IDs), "cached", len(res.IDs)-len(todo), "todo", len(todo))
+	slog.Info("юрданные", "total", len(res.IDs), "обработать", len(todo))
 
 	ferr := r.fetchAll(ctx, todo, res)
 	// Сохраняем даже после отмены: всё полученное к этому моменту стоит сберечь.
@@ -144,11 +175,7 @@ func (r *Runner) fetchAll(ctx context.Context, todo []int, res *Result) error {
 	for range workers {
 		wg.Go(func() {
 			for id := range jobs {
-				s, err := r.Client.Get(ctx, id)
-				if err == nil {
-					r.Cache.Put(s)
-				}
-				results <- err
+				results <- r.process(ctx, id, res)
 			}
 		})
 	}
@@ -181,4 +208,36 @@ func (r *Runner) fetchAll(ctx context.Context, todo []int, res *Result) error {
 		r.report(Progress{Stage: StageLegal, Message: "юрданные", Done: done, Total: len(todo)})
 	}
 	return ctx.Err()
+}
+
+// process обрабатывает одного продавца: берёт юрданные из кэша или с CDN,
+// при необходимости обогащает через реестр, сохраняет в кэш и отдаёт в OnRecord.
+// Запускается из воркеров, поэтому пишет только в потокобезопасные Cache/OnRecord.
+func (r *Runner) process(ctx context.Context, id int, res *Result) error {
+	s, ok := r.Cache.Get(id)
+	if !ok {
+		fetched, err := r.Client.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		s = fetched
+	}
+
+	if s.Enrich == nil && r.wantEnrich(s) {
+		e, err := r.Enricher.Enrich(ctx, s.INN)
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			slog.Warn("обогащение", "inn", s.INN, "err", err)
+		} else if e != nil {
+			s.Enrich = e
+		}
+	}
+
+	r.Cache.Put(s)
+	if r.OnRecord != nil {
+		r.OnRecord(Record{Hit: res.Hits[id], Supplier: s})
+	}
+	return nil
 }

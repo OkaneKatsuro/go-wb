@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,5 +154,71 @@ func TestRunStopsAtLimit(t *testing.T) {
 	}
 	if len(res.IDs) != 5 {
 		t.Fatalf("собрано %d продавцов, ожидалось 5", len(res.IDs))
+	}
+}
+
+type fakeEnricher struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (f *fakeEnricher) Enrich(ctx context.Context, inn string) (*wb.Enrichment, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, inn)
+	f.mu.Unlock()
+	return &wb.Enrichment{Kind: "ЮЛ", ShortName: "ООО " + inn, Source: "test"}, nil
+}
+
+// cdnWithINN отдаёт продавцам ИНН по id: 1 — юрлицо (10 цифр), 2 — ИП (12 цифр).
+func cdnWithINN(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/vol0/data/supplier-by-id/1.json":
+		w.Write([]byte(`{"supplierName":"ЮЛ","inn":"7700000001"}`))
+	case "/vol0/data/supplier-by-id/2.json":
+		w.Write([]byte(`{"supplierName":"ИП","inn":"770000000002"}`))
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func TestEnrichSkipsIPByDefault(t *testing.T) {
+	r, cache := newRunner(t, cdnWithINN, wb.IDList{1, 2})
+	fe := &fakeEnricher{}
+	r.Enricher = fe
+	r.EnrichIP = false // ИП не трогаем
+
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fe.calls) != 1 || fe.calls[0] != "7700000001" {
+		t.Fatalf("обогащать должны только юрлицо, вызовы: %v", fe.calls)
+	}
+	s1, _ := cache.Get(1)
+	s2, _ := cache.Get(2)
+	if s1.Enrich == nil || s1.Enrich.ShortName != "ООО 7700000001" {
+		t.Fatalf("юрлицо должно быть обогащено: %+v", s1.Enrich)
+	}
+	if s2.Enrich != nil {
+		t.Fatalf("ИП не должен обогащаться без EnrichIP: %+v", s2.Enrich)
+	}
+}
+
+func TestEnrichIPAndOnRecord(t *testing.T) {
+	r, _ := newRunner(t, cdnWithINN, wb.IDList{1, 2})
+	r.Enricher = &fakeEnricher{}
+	r.EnrichIP = true
+
+	var mu sync.Mutex
+	got := map[int]bool{}
+	r.OnRecord = func(rec Record) {
+		mu.Lock()
+		got[rec.Supplier.ID] = rec.Supplier.Enrich != nil
+		mu.Unlock()
+	}
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !got[1] || !got[2] {
+		t.Fatalf("оба продавца должны пройти через OnRecord обогащёнными: %v", got)
 	}
 }

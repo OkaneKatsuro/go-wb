@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 
 	"github.com/OkaneKatsuro/go-wb/internal/collect"
+	"github.com/OkaneKatsuro/go-wb/internal/ofdata"
 	"github.com/OkaneKatsuro/go-wb/internal/store"
 	"github.com/OkaneKatsuro/go-wb/internal/wb"
 )
@@ -25,8 +27,9 @@ import (
 // поэтому дальше программа работает с обычными значениями, а не с указателями.
 type config struct {
 	queries, ids, out, idsOut, profile, proxy, dest, version, cache, dump string
-	pages, rps, limit                                                     int
-	searchOnly                                                            bool
+	format, ofdataKey                                                     string
+	pages, rps, limit, ofdataRps                                          int
+	searchOnly, enrich, enrichIP                                          bool
 }
 
 func main() {
@@ -45,6 +48,11 @@ func main() {
 	flag.IntVar(&c.limit, "limit", 0, "остановить сбор, набрав столько уникальных продавцов (0 = без лимита)")
 	flag.StringVar(&c.cache, "cache", "out/cache.json", "кэш юрданных")
 	flag.StringVar(&c.dump, "dump", "out/first_response.json", "сохранить первый сырой ответ поиска (пусто = не сохранять)")
+	flag.StringVar(&c.format, "format", "csv", "формат вывода: csv или ndjson")
+	flag.BoolVar(&c.enrich, "enrich", false, "обогащать юрданные из реестра OFData")
+	flag.BoolVar(&c.enrichIP, "enrich-ip", false, "обогащать и ИП (12-значный ИНН), иначе только юрлица")
+	flag.StringVar(&c.ofdataKey, "ofdata-key", "", "ключ OFData (по умолчанию из переменной OFDATA_KEY)")
+	flag.IntVar(&c.ofdataRps, "ofdata-rps", 3, "запросов в секунду к OFData")
 	flag.Parse()
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
@@ -100,6 +108,10 @@ func run(ctx context.Context, c config) error {
 		sources = append(sources, wb.QuerySearch{Searcher: s, Queries: queries, Pages: c.pages})
 	}
 
+	if c.format != "csv" && c.format != "ndjson" {
+		return fmt.Errorf("неизвестный -format %q (csv или ndjson)", c.format)
+	}
+
 	cache, err := store.Load(c.cache)
 	if err != nil {
 		return err
@@ -113,7 +125,38 @@ func run(ctx context.Context, c config) error {
 		Limit:      c.limit,
 		OnProgress: cliProgress(),
 	}
+
+	// Обогащение из OFData, если включено.
+	if c.enrich {
+		key := c.ofdataKey
+		if key == "" {
+			key = os.Getenv("OFDATA_KEY")
+		}
+		en, err := ofdata.New(key, c.ofdataRps)
+		if err != nil {
+			return err
+		}
+		runner.Enricher = en
+		runner.EnrichIP = c.enrichIP
+	}
+
+	// NDJSON отдаётся потоком по мере готовности продавцов.
+	var ndw *collect.NDJSONWriter
+	var closeOut func() error
+	if c.format == "ndjson" && !c.searchOnly {
+		w, closeFn, err := openOut(c.out)
+		if err != nil {
+			return err
+		}
+		closeOut = closeFn
+		ndw = collect.NewNDJSONWriter(w)
+		runner.OnRecord = ndw.Write
+	}
+
 	res, err := runner.Run(ctx)
+	if closeOut != nil {
+		closeOut()
+	}
 
 	// Частичный результат стоит записать, даже когда err != nil.
 	if res != nil && c.idsOut != "" && len(res.IDs) > 0 {
@@ -129,12 +172,36 @@ func run(ctx context.Context, c config) error {
 	if c.searchOnly {
 		return nil
 	}
-	n, err := collect.WriteCSVFile(c.out, res, cache)
+	if c.format == "ndjson" {
+		slog.Info("готово", "rows", ndw.Count(), "format", "ndjson", "failed", res.Failed)
+		return nil
+	}
+	n, err := writeCSVOut(c.out, res, cache)
 	if err != nil {
 		return err
 	}
 	slog.Info("готово", "rows", n, "file", c.out, "failed", res.Failed)
 	return nil
+}
+
+// openOut возвращает writer для вывода: stdout при "-" или пустом пути, иначе файл.
+func openOut(path string) (io.Writer, func() error, error) {
+	if path == "" || path == "-" {
+		return os.Stdout, func() error { return nil }, nil
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, f.Close, nil
+}
+
+// writeCSVOut пишет CSV в файл или в stdout (при "-").
+func writeCSVOut(path string, res *collect.Result, cache *store.Cache) (int, error) {
+	if path == "" || path == "-" {
+		return collect.WriteCSV(os.Stdout, res, cache)
+	}
+	return collect.WriteCSVFile(path, res, cache)
 }
 
 // cliProgress печатает смену этапа и каждую сотую запись юрданных.

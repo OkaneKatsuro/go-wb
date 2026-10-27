@@ -30,7 +30,33 @@ type Supplier struct {
 	Deactivated  bool   `json:"deactivated"`
 	// NotFound мы ставим сами, когда CDN отвечает 404, чтобы не запрашивать этот id снова.
 	NotFound bool `json:"notFound,omitempty"`
+	// Enrich — обогащение из внешнего реестра (OFData), nil пока не запрашивали.
+	// Хранится прямо в Supplier, поэтому кэш сохраняет его между запусками.
+	Enrich *Enrichment `json:"enrich,omitempty"`
 }
+
+// Enrichment — нормализованные данные из реестра (ЕГРЮЛ/ЕГРИП через OFData),
+// одинаковые по форме для юрлица и ИП.
+type Enrichment struct {
+	Kind       string `json:"kind"`                 // "ЮЛ" или "ИП"
+	Okopf      string `json:"okopf,omitempty"`      // организационно-правовая форма
+	FullName   string `json:"fullName,omitempty"`   // полное наименование / ФИО
+	ShortName  string `json:"shortName,omitempty"`  // сокращённое наименование
+	OGRN       string `json:"ogrn,omitempty"`       // ОГРН или ОГРНИП
+	Status     string `json:"status,omitempty"`     // «Действует», «Ликвидировано» и т.п.
+	StatusCode string `json:"statusCode,omitempty"` // код статуса
+	RegDate    string `json:"regDate,omitempty"`    // дата регистрации
+	Address    string `json:"address,omitempty"`    // юр. адрес (ЮЛ) или регион (ИП)
+	Region     string `json:"region,omitempty"`     // регион
+	OkvedCode  string `json:"okvedCode,omitempty"`  // основной ОКВЭД, код
+	OkvedName  string `json:"okvedName,omitempty"`  // основной ОКВЭД, название
+	Director   string `json:"director,omitempty"`   // руководитель (ЮЛ) или сам ИП
+	Source     string `json:"source"`               // источник, напр. "ofdata"
+}
+
+// IsIP сообщает, что ИНН принадлежит индивидуальному предпринимателю.
+// У ИП ИНН из 12 цифр, у юрлица — из 10.
+func IsIP(inn string) bool { return len(inn) == 12 }
 
 // SupplierClient получает записи Supplier с общим ограничением скорости.
 // Безопасен для конкурентного доступа.
