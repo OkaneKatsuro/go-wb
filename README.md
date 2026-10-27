@@ -65,7 +65,7 @@ flowchart TD
 
     subgraph RUN["collect.Runner.Run(ctx)"]
         direction TB
-        H["1. Hits[id] = hit<br/>map убирает дубли"]
+        H["1. Hits[id] = hit<br/>map убирает дубли<br/>при Limit: на N-м уникальном останавливает сбор"]
         I["2. IDs = отсортированные ключи<br/>порядок обхода map случайный"]
         T["3. todo = id, которых ещё нет в кэше"]
         F["4. fetchAll(ctx, todo)<br/>пул воркеров, схема 2"]
@@ -203,18 +203,23 @@ flowchart TD
 
 ### 6. Один `ctx` на всё
 
-Контекст создаётся один раз наверху и передаётся вниз первым аргументом через каждую функцию.
-Отмена в любой точке доходит до каждого `select`, каждого `sleep` и каждого HTTP-запроса.
+Корневой `ctx` создаётся один раз наверху. Отмена в любой точке доходит до каждого
+`select`, каждого `sleep` и каждого HTTP-запроса. У этапа сбора свой дочерний
+`collectCtx`: при достижении `-limit` его отменяют, и сбор останавливается, а этап
+юрданных на исходном `ctx` не прерывается. Родительский `ctx` (Ctrl+C, SIGTERM)
+гасит оба.
 
 ```mermaid
-flowchart LR
-    A["main: signal.NotifyContext<br/>или web.start: context.WithCancel"] --> B["Runner.Run(ctx)"]
-    B --> C["Source.Collect(ctx, emit)"]
-    B --> D["fetchAll(ctx, todo)"]
+flowchart TD
+    A["main: signal.NotifyContext<br/>web.start: context.WithCancel"] --> B["Runner.Run(ctx)"]
+    B --> CC["collectCtx := WithCancel(ctx)<br/>отдельный для сбора"]
+    B -. "набрано N → stopCollect()" .-> CC
+    CC --> C["Source.Collect(collectCtx, emit)"]
+    C --> H["Searcher.fetchPage(collectCtx)"]
+    B --> D["fetchAll(ctx, todo)<br/>исходный ctx, лимит его не трогает"]
     D --> E["Client.Get(ctx, id)"]
     E --> F["http.NewRequestWithContext"]
     E --> G["sleep(ctx, d) между ретраями"]
-    C --> H["Searcher.fetchPage(ctx)"]
     H --> F
     H --> G
 ```
