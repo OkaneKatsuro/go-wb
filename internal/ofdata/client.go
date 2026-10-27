@@ -134,7 +134,7 @@ func (c *Client) fetch(ctx context.Context, method, inn string) (*wb.Enrichment,
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, true, err
+		return nil, true, redactURLError(err)
 	}
 	defer resp.Body.Close()
 
@@ -155,6 +155,17 @@ func (c *Client) fetch(ctx context.Context, method, inn string) (*wb.Enrichment,
 	default:
 		return nil, false, fmt.Errorf("статус %d", resp.StatusCode)
 	}
+}
+
+// redactURLError убирает URL из ошибки http.Client.Do. В URL лежит key
+// в query-строке, а *url.Error печатает весь URL, поэтому в логи он попасть не должен.
+// Оставляем только операцию и внутреннюю причину (dial, timeout и т.п.).
+func redactURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("%s: %w", ue.Op, ue.Err)
+	}
+	return err
 }
 
 func mapEnrichment(method string, r *apiResp) *wb.Enrichment {

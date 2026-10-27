@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -97,5 +98,21 @@ func TestEnrichEmptyINN(t *testing.T) {
 func TestNewRequiresKey(t *testing.T) {
 	if _, err := New("", 3); err == nil {
 		t.Fatal("без ключа New должен вернуть ошибку")
+	}
+}
+
+func TestErrorDoesNotLeakKey(t *testing.T) {
+	c, err := New("SUPERSECRETKEY", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = "http://127.0.0.1:1" // никто не слушает → ошибка Do с URL
+	c.Backoff = time.Millisecond
+	_, err = c.Enrich(context.Background(), "7707083893")
+	if err == nil {
+		t.Fatal("ожидалась сетевая ошибка")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETKEY") {
+		t.Fatalf("ключ утёк в ошибку: %v", err)
 	}
 }
