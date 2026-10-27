@@ -18,6 +18,7 @@
 ```
 cmd/wb-sellers/      CLI: флаги, сигналы, вызов конвейера
 cmd/wb-server/       HTTP-сервер: точка входа, graceful shutdown
+cmd/wb-search/       сбор supplierId из каталога витрины через headless-браузер (go-rod)
 internal/wb/         предметная область: Source, SellerHit, Supplier, HTTP-клиенты
 internal/store/      Cache: память + JSON-файл, безопасен для горутин
 internal/collect/    конвейер Runner: источник → пул воркеров → CSV/NDJSON
@@ -280,6 +281,14 @@ gofmt -l .              # должно быть пусто
 В CLI он добавляется в слайс `sources` в `cmd/wb-sellers/main.go`,
 в сервере — в замыкание `NewSearch` в `cmd/wb-server/main.go`.
 Контракт: вызывать `emit` синхронно и возвращать `ctx.Err()`, как только контекст отменён.
+
+## Сбор id из каталога (cmd/wb-search)
+
+Отдельная команда, которая открывает каталог витрины в headless-браузере (go-rod)
+и собирает `supplierId` по запросу, выводя их в CSV. Нужна, когда продавцов берут
+по категории, а не по готовому списку id. Это самостоятельный инструмент: он не
+входит в основной конвейер, его вывод можно подать дальше в `wb-sellers`. Собирается
+отдельно: `go build ./cmd/wb-search`. Использование подчиняется правилам Wildberries.
 
 ## Остановка по количеству
 

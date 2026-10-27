@@ -4,13 +4,13 @@ go 1.26.1
 
 require (
 	github.com/andybalholm/brotli v1.2.7
+	github.com/go-rod/rod v0.116.2
+	github.com/go-rod/stealth v0.4.9
 	github.com/klauspost/compress v1.20.3
 	github.com/megamen32/site-mimic v0.3.0
 )
 
 require (
-	github.com/go-rod/rod v0.116.2 // indirect
-	github.com/go-rod/stealth v0.4.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/megamen32/headless-client v0.2.0 // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
