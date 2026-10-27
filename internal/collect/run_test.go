@@ -124,3 +124,34 @@ func TestRunSearchOnly(t *testing.T) {
 		t.Fatalf("IDs = %v", res.IDs)
 	}
 }
+
+// endlessSource шлёт продавцов с растущими id, пока ctx не отменят.
+// Так проверяется, что Runner.Limit останавливает сбор, а не ждёт конца источника.
+type endlessSource struct{ emitted int }
+
+func (s *endlessSource) Collect(ctx context.Context, emit func(wb.SellerHit)) error {
+	for id := 1; ; id++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		emit(wb.SellerHit{SupplierID: id})
+		s.emitted++
+	}
+}
+
+func TestRunStopsAtLimit(t *testing.T) {
+	cdn := func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"supplierName":"x"}`))
+	}
+	src := &endlessSource{}
+	r, _ := newRunner(t, cdn, src)
+	r.Limit = 5
+
+	res, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("достижение лимита не должно быть ошибкой: %v", err)
+	}
+	if len(res.IDs) != 5 {
+		t.Fatalf("собрано %d продавцов, ожидалось 5", len(res.IDs))
+	}
+}

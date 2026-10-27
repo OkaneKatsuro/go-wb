@@ -174,7 +174,7 @@ func (s *Server) update(j *job, fn func(st *State)) {
 	s.mu.Unlock()
 }
 
-func (s *Server) start(src wb.Source) (State, error) {
+func (s *Server) start(src wb.Source, limit int) (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.job != nil && s.job.state.Running {
@@ -191,17 +191,17 @@ func (s *Server) start(src wb.Source) (State, error) {
 		},
 	}
 	s.job = j
-	go s.run(ctx, cancel, j, src)
+	go s.run(ctx, cancel, j, src, limit)
 	return j.state, nil
 }
 
-func (s *Server) run(ctx context.Context, cancel context.CancelFunc, j *job, src wb.Source) {
+func (s *Server) run(ctx context.Context, cancel context.CancelFunc, j *job, src wb.Source, limit int) {
 	defer close(j.finished)
 	defer cancel()
 	id := j.state.ID // записан до оператора go, дальше не меняется
 
 	runner := &collect.Runner{
-		Source: src, Client: s.cfg.Client, Cache: s.cfg.Cache, Workers: s.cfg.Workers,
+		Source: src, Client: s.cfg.Client, Cache: s.cfg.Cache, Workers: s.cfg.Workers, Limit: limit,
 		OnProgress: func(p collect.Progress) {
 			s.update(j, func(st *State) {
 				st.Stage, st.Message, st.Done, st.Total = string(p.Stage), p.Message, p.Done, p.Total
@@ -343,7 +343,11 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "неизвестный режим", http.StatusBadRequest)
 		return
 	}
-	st, err := s.start(src)
+	limit, _ := strconv.Atoi(r.FormValue("limit"))
+	if limit < 0 {
+		limit = 0
+	}
+	st, err := s.start(src, limit)
 	if errors.Is(err, errBusy) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return

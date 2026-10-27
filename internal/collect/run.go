@@ -47,6 +47,7 @@ type Runner struct {
 
 	SearchOnly bool // остановиться после этапа Source
 	SaveEvery  int  // сохранять кэш каждые N полученных продавцов, 0 = 200
+	Limit      int  // остановить сбор, набрав столько уникальных продавцов, 0 = без лимита
 
 	// OnProgress необязателен. Всегда вызывается из той горутины, что вызвала Run.
 	OnProgress func(Progress)
@@ -63,17 +64,29 @@ func (r *Runner) report(p Progress) {
 func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	res := &Result{Hits: map[int]wb.SellerHit{}}
 
+	// Отдельный контекст сбора: достигнув лимита, отменяем только его, чтобы
+	// следующий этап (юрданные) работал на исходном ctx.
+	collectCtx, stopCollect := context.WithCancel(ctx)
+	defer stopCollect()
+	reachedLimit := false
+
 	r.report(Progress{Stage: StageSearch, Message: "сбор supplierId"})
-	err := r.Source.Collect(ctx, func(h wb.SellerHit) {
+	err := r.Source.Collect(collectCtx, func(h wb.SellerHit) {
 		if _, ok := res.Hits[h.SupplierID]; ok {
 			return
 		}
 		res.Hits[h.SupplierID] = h
-		r.report(Progress{Stage: StageSearch, Message: "сбор supplierId", Done: len(res.Hits)})
+		r.report(Progress{Stage: StageSearch, Message: "сбор supplierId", Done: len(res.Hits), Total: r.Limit})
+		if r.Limit > 0 && len(res.Hits) >= r.Limit {
+			reachedLimit = true
+			stopCollect() // цель набрана, источник остановится на ближайшей проверке ctx
+		}
 	})
 	res.IDs = slices.Sorted(maps.Keys(res.Hits))
 	switch {
 	case err == nil:
+	case reachedLimit && ctx.Err() == nil:
+		// Сбор прервали мы сами, набрав лимит. Это штатное завершение, не ошибка.
 	case errors.Is(err, wb.ErrChallenge):
 		res.Warning = err.Error()
 		slog.Warn("поиск остановлен, продолжаю с тем, что собрано", "sellers", len(res.IDs))

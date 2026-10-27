@@ -25,7 +25,7 @@ import (
 // поэтому дальше программа работает с обычными значениями, а не с указателями.
 type config struct {
 	queries, ids, out, idsOut, profile, proxy, dest, version, cache, dump string
-	pages, rps                                                            int
+	pages, rps, limit                                                     int
 	searchOnly                                                            bool
 }
 
@@ -42,6 +42,7 @@ func main() {
 	flag.StringVar(&c.dest, "dest", "-1257786", "регион WB (dest)")
 	flag.StringVar(&c.version, "api-version", "v18", "версия поискового API")
 	flag.IntVar(&c.rps, "rps", 5, "запросов в секунду к CDN юрданных")
+	flag.IntVar(&c.limit, "limit", 0, "остановить сбор, набрав столько уникальных продавцов (0 = без лимита)")
 	flag.StringVar(&c.cache, "cache", "out/cache.json", "кэш юрданных")
 	flag.StringVar(&c.dump, "dump", "out/first_response.json", "сохранить первый сырой ответ поиска (пусто = не сохранять)")
 	flag.Parse()
@@ -109,6 +110,7 @@ func run(ctx context.Context, c config) error {
 		Cache:      cache,
 		Workers:    c.rps * 2,
 		SearchOnly: c.searchOnly,
+		Limit:      c.limit,
 		OnProgress: cliProgress(),
 	}
 	res, err := runner.Run(ctx)
