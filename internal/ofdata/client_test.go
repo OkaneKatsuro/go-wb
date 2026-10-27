@@ -2,11 +2,15 @@ package ofdata
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/OkaneKatsuro/go-wb/internal/wb"
 )
 
 const companyJSON = `{"data":{"ОГРН":"1027700132195","ИНН":"7707083893","КПП":"773601001",
@@ -42,7 +46,7 @@ func TestEnrichCompany(t *testing.T) {
 		if r.URL.Query().Get("inn") != "7707083893" || r.URL.Query().Get("key") != "test-key" {
 			t.Errorf("неверные параметры: %s", r.URL.RawQuery)
 		}
-		w.Write([]byte(companyJSON))
+		_, _ = w.Write([]byte(companyJSON))
 	})
 	e, err := c.Enrich(context.Background(), "7707083893")
 	if err != nil {
@@ -50,7 +54,7 @@ func TestEnrichCompany(t *testing.T) {
 	}
 	if e.Kind != "ЮЛ" || e.ShortName != "ПАО СБЕРБАНК" || e.Status != "Действует" ||
 		e.OGRN != "1027700132195" || e.Director != "Греф Герман Оскарович" ||
-		e.OkvedCode != "64.19" || e.Address == "" {
+		e.OkvedCode != "64.19" || e.Address == "" || e.Source != "ofdata" || e.NotFound {
 		t.Fatalf("неверный маппинг юрлица: %+v", e)
 	}
 }
@@ -60,7 +64,7 @@ func TestEnrichIP(t *testing.T) {
 		if r.URL.Path != "/entrepreneur" {
 			t.Errorf("ИП должен идти в /entrepreneur, а не %s", r.URL.Path)
 		}
-		w.Write([]byte(ipJSON))
+		_, _ = w.Write([]byte(ipJSON))
 	})
 	e, err := c.Enrich(context.Background(), "544052334508")
 	if err != nil {
@@ -73,25 +77,100 @@ func TestEnrichIP(t *testing.T) {
 	}
 }
 
-func TestEnrichNotFound(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"data":{},"meta":{"status":"ok","balance":100}}`))
-	})
-	e, err := c.Enrich(context.Background(), "7700000000")
-	if err != nil {
-		t.Fatalf("не найдено — не ошибка: %v", err)
-	}
-	if e != nil {
-		t.Fatalf("ожидался nil при отсутствии записи, получено %+v", e)
+func TestEnrichNotFoundIsMarked(t *testing.T) {
+	for name, h := range map[string]http.HandlerFunc{
+		"пустой data": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"data":{},"meta":{"status":"ok","balance":100}}`))
+		},
+		"404": func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newTestClient(t, h)
+			e, err := c.Enrich(context.Background(), "7700000000")
+			if err != nil {
+				t.Fatalf("не найдено — не ошибка: %v", err)
+			}
+			if e == nil || !e.NotFound || e.Source != "ofdata" {
+				t.Fatalf("ожидалась пометка NotFound, получено %+v", e)
+			}
+		})
 	}
 }
 
-func TestEnrichEmptyINN(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Error("пустой ИНН не должен уходить в сеть")
+func TestEnrichAPIErrorIsNotNotFound(t *testing.T) {
+	// Исчерпанный баланс или неверный запрос OFData может прислать и с 200.
+	// Это ошибка, а не «записи нет»: иначе она навсегда осела бы в кэше.
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{},"meta":{"status":"error","message":"Недостаточно средств"}}`))
 	})
-	if e, err := c.Enrich(context.Background(), ""); err != nil || e != nil {
-		t.Fatalf("пустой ИНН: e=%v err=%v", e, err)
+	e, err := c.Enrich(context.Background(), "7700000000")
+	if err == nil || !strings.Contains(err.Error(), "Недостаточно средств") {
+		t.Fatalf("e=%v err=%v, ожидалась ошибка с текстом API", e, err)
+	}
+}
+
+func TestEnrichInvalidINNDoesNotHitNetwork(t *testing.T) {
+	c := newTestClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("неверный ИНН не должен уходить в сеть")
+	})
+	for _, inn := range []string{"", "123", "123456789", "7707O83893"} {
+		if e, err := c.Enrich(context.Background(), inn); err == nil || e != nil {
+			t.Errorf("ИНН %q: e=%v err=%v, ожидалась ошибка", inn, e, err)
+		}
+	}
+}
+
+func TestEnrichRetriesOn429And5xx(t *testing.T) {
+	var calls atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusTooManyRequests)
+		case 2:
+			w.WriteHeader(http.StatusBadGateway)
+		default:
+			_, _ = w.Write([]byte(companyJSON))
+		}
+	})
+	if _, err := c.Enrich(context.Background(), "7707083893"); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("calls = %d, want 3", calls.Load())
+	}
+}
+
+func TestEnrichAuthErrorShortCircuits(t *testing.T) {
+	var calls atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	for range 3 {
+		if _, err := c.Enrich(context.Background(), "7707083893"); !errors.Is(err, ErrAuth) {
+			t.Fatalf("err = %v, want ErrAuth", err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("после отклонённого ключа клиент сходил в сеть %d раз, want 1", calls.Load())
+	}
+	if !errors.Is(ErrAuth, wb.ErrEnrichUnavailable) {
+		t.Fatal("ErrAuth должен оборачивать wb.ErrEnrichUnavailable, иначе Runner не остановится")
+	}
+}
+
+func TestEnrichRejectsHugeBodyWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"data":{"ОГРН":"` + strings.Repeat("1", maxBody) + `"}}`))
+	})
+	_, err := c.Enrich(context.Background(), "7707083893")
+	if !errors.Is(err, wb.ErrBodyTooLarge) {
+		t.Fatalf("err = %v, want ErrBodyTooLarge", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("слишком большой ответ не повторяется: calls = %d", calls.Load())
 	}
 }
 

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -59,5 +60,38 @@ func TestConcurrentPut(t *testing.T) {
 	wg.Wait()
 	if c.Len() != 100 {
 		t.Fatalf("Len = %d, want 100", c.Len())
+	}
+}
+
+// Несколько Save одновременно (прогресс-сохранение Runner и Save при остановке
+// сервера) не должны ломать файл: каждый пишет полный снимок, последний побеждает.
+func TestConcurrentSaveKeepsFileValid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.json")
+	c, _ := Load(path)
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Go(func() {
+			c.Put(&wb.Supplier{ID: i})
+			if err := c.Save(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	if _, err := Load(path); err != nil {
+		t.Fatalf("файл после параллельных Save не читается: %v", err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("временный файл не должен оставаться")
+	}
+}
+
+func TestLoadCorruptFileIsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("повреждённый кэш должен давать ошибку, а не пустой кэш")
 	}
 }
