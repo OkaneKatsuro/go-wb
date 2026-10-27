@@ -153,11 +153,19 @@ func TestQuerySearchSkipsFailedQueryButStopsOnChallenge(t *testing.T) {
 	emit := func(h SellerHit) { hits = append(hits, h) }
 
 	q := QuerySearch{Searcher: s, Queries: []string{"bad", "good"}, Pages: 1}
-	if err := q.Collect(context.Background(), emit); err != nil {
-		t.Fatalf("упавший запрос должен пропускаться: %v", err)
+	err := q.Collect(context.Background(), emit)
+	if !errors.Is(err, ErrQueriesSkipped) || !strings.Contains(err.Error(), "1 из 2") {
+		t.Fatalf("упавший запрос пропускается, но возвращается ErrQueriesSkipped со сводкой: %v", err)
 	}
 	if len(hits) != 1 || hits[0].Query != "good" {
 		t.Fatalf("hits = %+v", hits)
+	}
+
+	// Multi не останавливается на ErrQueriesSkipped: следующий источник отработает.
+	hits = nil
+	err = Multi{q, IDList{42}}.Collect(context.Background(), emit)
+	if !errors.Is(err, ErrQueriesSkipped) || len(hits) != 2 || hits[1].SupplierID != 42 {
+		t.Fatalf("Multi: err=%v hits=%+v", err, hits)
 	}
 
 	hits = nil

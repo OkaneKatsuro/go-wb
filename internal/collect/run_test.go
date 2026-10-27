@@ -117,6 +117,27 @@ func TestRunCountsFailedSuppliers(t *testing.T) {
 	}
 }
 
+// skippingSource ведёт себя как QuerySearch, у которого часть запросов упала.
+type skippingSource struct{}
+
+func (skippingSource) Collect(_ context.Context, emit func(wb.SellerHit)) error {
+	emit(wb.SellerHit{SupplierID: 1})
+	return fmt.Errorf("%w (1 из 2): %q: статус 403", wb.ErrQueriesSkipped, "куртка")
+}
+
+func TestRunSkippedQueriesBecomeWarning(t *testing.T) {
+	r, _ := newRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}, skippingSource{})
+	res, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("пропущенные запросы — не ошибка прогона: %v", err)
+	}
+	if len(res.IDs) != 1 || !strings.Contains(res.Warning, "1 из 2") {
+		t.Fatalf("IDs=%v Warning=%q", res.IDs, res.Warning)
+	}
+}
+
 func TestRunStopsOnCancel(t *testing.T) {
 	cdn := func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done() // никогда не отвечает; выходит, когда клиент отключается

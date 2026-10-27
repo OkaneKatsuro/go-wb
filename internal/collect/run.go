@@ -150,6 +150,10 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	case errors.Is(err, wb.ErrChallenge):
 		res.Warning = err.Error()
 		slog.Warn("поиск остановлен, продолжаю с тем, что собрано", "sellers", len(res.IDs))
+	case errors.Is(err, wb.ErrQueriesSkipped):
+		// Часть запросов не выполнилась: это видно в Warning, а не спрятано в логе.
+		res.Warning = err.Error()
+		slog.Warn("поиск выполнен не полностью", "sellers", len(res.IDs), "err", err)
 	default:
 		return res, err
 	}

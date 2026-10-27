@@ -203,6 +203,9 @@ func run(ctx context.Context, c config) error {
 	if err != nil {
 		return err
 	}
+	if res.Warning != "" {
+		slog.Warn("прогон завершён с предупреждением", "warning", res.Warning)
+	}
 	if c.searchOnly {
 		return nil
 	}

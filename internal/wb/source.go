@@ -5,9 +5,16 @@ package wb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
+
+// ErrQueriesSkipped — часть поисковых запросов не выполнилась (например, 403
+// или 429 после повторов), остальные обработаны. Это предупреждение, а не
+// отказ: Runner кладёт его в Result.Warning, чтобы «готово, 0 продавцов» не
+// выглядело как успех, а Multi продолжает со следующим источником.
 
 // SellerHit — один продавец, найденный источником Source. Обязателен только SupplierID.
 type SellerHit struct {
@@ -44,22 +51,32 @@ func (l IDList) Collect(ctx context.Context, emit func(SellerHit)) error {
 	return nil
 }
 
-// Multi запускает несколько источников по очереди и останавливается на первой ошибке.
+var ErrQueriesSkipped = errors.New("часть запросов пропущена")
+
+// Multi запускает несколько источников по очереди и останавливается на первой
+// ошибке. ErrQueriesSkipped не останавливает: он копится и возвращается в конце.
 type Multi []Source
 
 func (m Multi) Collect(ctx context.Context, emit func(SellerHit)) error {
+	var warn error
 	for _, s := range m {
-		if err := s.Collect(ctx, emit); err != nil {
+		err := s.Collect(ctx, emit)
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrQueriesSkipped):
+			warn = errors.Join(warn, err)
+		default:
 			return err
 		}
 	}
-	return nil
+	return warn
 }
 
 // QuerySearch прогоняет Searcher по нескольким запросам.
 //
-// Упавший запрос логируется и пропускается. ErrChallenge останавливает весь
-// прогон, потому что каждый следующий запрос получил бы тот же ответ.
+// Упавший запрос логируется и пропускается, а в конце Collect возвращает
+// ErrQueriesSkipped со сводкой. ErrChallenge останавливает весь прогон,
+// потому что каждый следующий запрос получил бы тот же ответ.
 type QuerySearch struct {
 	Searcher *Searcher
 	Queries  []string
@@ -67,6 +84,7 @@ type QuerySearch struct {
 }
 
 func (q QuerySearch) Collect(ctx context.Context, emit func(SellerHit)) error {
+	var skipped []string
 	for i, query := range q.Queries {
 		slog.Info("поиск", "n", i+1, "of", len(q.Queries), "query", query)
 		err := q.Searcher.Collect(ctx, query, q.Pages, emit)
@@ -78,9 +96,20 @@ func (q QuerySearch) Collect(ctx context.Context, emit func(SellerHit)) error {
 		}
 		if err != nil {
 			slog.Warn("запрос пропущен", "query", query, "err", err)
+			skipped = append(skipped, fmt.Sprintf("%q: %v", query, err))
 		}
 	}
-	return nil
+	if len(skipped) == 0 {
+		return nil
+	}
+	total := len(skipped)
+	const show = 3 // в сводке хватит первых причин, остальные есть в логе
+	more := ""
+	if total > show {
+		more = fmt.Sprintf(" и ещё %d", total-show)
+		skipped = skipped[:show]
+	}
+	return fmt.Errorf("%w (%d из %d): %s%s", ErrQueriesSkipped, total, len(q.Queries), strings.Join(skipped, "; "), more)
 }
 
 // Sleep ждёт d или отмены ctx — что наступит раньше.
