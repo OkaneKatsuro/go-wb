@@ -1,5 +1,8 @@
 out/
 *.csv
+
+# секреты: ключ OFData и т.п.
+.env
 *.tmp
 .zed/
 

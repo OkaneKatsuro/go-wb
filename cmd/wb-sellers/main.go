@@ -49,6 +49,12 @@ func main() {
 // realMain возвращает код выхода, чтобы os.Exit вызывался один раз снаружи
 // и все defer (в том числе остановка обработчика сигналов) успели отработать.
 func realMain() int {
+	// Ключи и прочие секреты можно держать в .env рядом с проектом; переменные
+	// окружения важнее файла. Файл в .gitignore.
+	if err := loadDotEnv(".env"); err != nil {
+		slog.Error("чтение .env", "err", err)
+		return exitErr
+	}
 	var c config
 	flag.StringVar(&c.queries, "queries", "", "файл с поисковыми запросами, один на строку")
 	flag.StringVar(&c.ids, "ids", "", "файл с supplierId: по одному id или ссылке на строку, либо CSV с колонкой supplier_id (вывод wb-search)")
@@ -63,7 +69,7 @@ func realMain() int {
 	flag.StringVar(&c.format, "format", "csv", "формат вывода: csv или ndjson")
 	flag.BoolVar(&c.enrich, "enrich", false, "обогащать юрданные из реестра OFData")
 	flag.BoolVar(&c.enrichIP, "enrich-ip", false, "обогащать и ИП (12-значный ИНН), иначе только юрлица")
-	flag.StringVar(&c.ofdataKey, "ofdata-key", "", "ключ OFData (по умолчанию из переменной OFDATA_KEY)")
+	flag.StringVar(&c.ofdataKey, "ofdata-key", "", "ключ OFData (по умолчанию из переменной OFDATA_KEY или файла .env)")
 	flag.IntVar(&c.ofdataRps, "ofdata-rps", 3, "запросов в секунду к OFData")
 	flag.Parse()
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
