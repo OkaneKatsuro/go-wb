@@ -46,6 +46,10 @@ linters:
         linters:
           - gosec
           - noctx
+      - path: internal/wbsearch/
+        linters:
+          - gosec
+        text: G204 # запуск wb-search по пути из флага — назначение пакета
 
 formatters:
   enable:

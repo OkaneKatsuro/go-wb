@@ -72,13 +72,19 @@ func (m Multi) Collect(ctx context.Context, emit func(SellerHit)) error {
 	return warn
 }
 
+// QuerySearcher умеет пройти страницы одного запроса и отдать продавцов.
+// Реализации: *Searcher (site-mimic) и wbsearch.Runner (cmd/wb-search подпроцессом).
+type QuerySearcher interface {
+	Collect(ctx context.Context, query string, maxPages int, emit func(SellerHit)) error
+}
+
 // QuerySearch прогоняет Searcher по нескольким запросам.
 //
 // Упавший запрос логируется и пропускается, а в конце Collect возвращает
 // ErrQueriesSkipped со сводкой. ErrChallenge останавливает весь прогон,
 // потому что каждый следующий запрос получил бы тот же ответ.
 type QuerySearch struct {
-	Searcher *Searcher
+	Searcher QuerySearcher
 	Queries  []string
 	Pages    int
 }

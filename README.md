@@ -7,7 +7,15 @@
 
 Типичный сценарий: задаёшь список id или поисковые запросы (категории) и, по желанию,
 сколько продавцов нужно (`-limit`). На выходе юрданные этих продавцов, при желании
-обогащённые из реестра ЕГРЮЛ/ЕГРИП через OFData (`-enrich`).
+обогащённые из реестра ЕГРЮЛ/ЕГРИП через OFData (`-enrich`). Одной командой:
+
+```bash
+go run ./cmd/wb-sellers -queries queries.txt -limit 20 -out out/sellers.csv
+```
+
+Поиск по запросам идёт через `wb-search`: конвейер сам запускает его по каждому запросу
+(на экране откроется окно браузера), забирает найденных продавцов и дальше работает как
+со списком id. Отдельных шагов и промежуточных файлов нет.
 
 Два бинарника на одном ядре:
 
@@ -20,7 +28,8 @@
 ```
 cmd/wb-sellers/      CLI: флаги, сигналы, вызов конвейера
 cmd/wb-server/       HTTP-сервер: точка входа, graceful shutdown
-cmd/wb-search/       сбор supplierId из каталога витрины через headless-браузер (go-rod)
+cmd/wb-search/       поиск товаров по запросу через браузер (go-rod); конвейер запускает его сам
+internal/wbsearch/   wb.Source поверх cmd/wb-search: подпроцесс на запрос, разбор его CSV
 internal/wb/         предметная область: Source, SellerHit, Supplier, HTTP-клиенты
 internal/store/      Cache: память + JSON-файл, безопасен для горутин
 internal/collect/    конвейер Runner: источник → пул воркеров → CSV/NDJSON
@@ -38,6 +47,9 @@ Dockerfile           multi-stage, distroless, итоговый образ ~17 М
 flowchart TD
     srv["cmd/wb-server"] --> web["internal/web<br/>HTTP, SSE, UI"]
     cli["cmd/wb-sellers"] --> collect
+    cli --> wbsearch["internal/wbsearch<br/>cmd/wb-search подпроцессом"]
+    srv --> wbsearch
+    wbsearch --> wb
     web --> collect["internal/collect<br/>Runner, CSV"]
     collect --> store["internal/store<br/>Cache"]
     collect --> wb["internal/wb<br/>типы, интерфейс Source, HTTP-клиенты"]
@@ -57,8 +69,8 @@ flowchart TD
     SRV["cmd/wb-server<br/>браузер → POST /api/start"]
 
     subgraph SOURCE["wb.Source — интерфейс с одним методом Collect(ctx, emit)"]
-        IDL["IDList<br/>готовый список id"]
-        QS["QuerySearch<br/>поиск WB по запросам"]
+        IDL["IDList / HitList<br/>готовый список id или CSV wb-search"]
+        QS["QuerySearch<br/>по запросам через QuerySearcher:<br/>wbsearch.Runner (браузер) или Searcher (site-mimic)"]
         MULTI["Multi<br/>несколько источников подряд"]
     end
 
@@ -243,8 +255,12 @@ flowchart TD
 # CLI: список id или ссылок на продавца, по одному на строку
 go run ./cmd/wb-sellers -ids ids.txt -out out/sellers.csv
 
-# Поиск по запросам (категориям) с остановкой на 100 уникальных продавцах
-go run ./cmd/wb-sellers -queries queries.txt -profile windows-chrome152.json -limit 100
+# Поиск по запросам (категориям) с остановкой на 100 уникальных продавцах.
+# Откроется окно браузера: поиск идёт через wb-search, который запускается сам.
+go run ./cmd/wb-sellers -queries queries.txt -limit 100
+
+# То же через поисковый API с профилем site-mimic (сейчас WB отвечает ему 403)
+go run ./cmd/wb-sellers -queries queries.txt -engine mimic -profile windows-chrome152.json -limit 100
 
 # Веб-интерфейс на http://localhost:8080
 go run ./cmd/wb-server
@@ -262,6 +278,12 @@ docker run --rm -p 8080:8080 -v "$PWD/out:/data" wb-server
 Строки, начинающиеся с `#`, пропускаются. Флаг `-limit N` останавливает сбор на N уникальных продавцах.
 
 Полный список флагов: `go run ./cmd/wb-sellers -h` и `go run ./cmd/wb-server -h`.
+
+Флаг `-engine` выбирает, как искать по запросам: `browser` (по умолчанию) запускает
+`wb-search` подпроцессом, `mimic` ходит в поисковый API через site-mimic. Бинарник
+`wb-search` ищется рядом с `wb-sellers`/`wb-server`, в PATH, а при запуске через `go run`
+из каталога модуля собирается на лету. Собранным бинарникам положите рядом `wb-search`
+(`go build ./cmd/wb-search`) или укажите путь флагом `-wb-search`.
 
 ### Доступ к серверу
 
@@ -308,25 +330,20 @@ govulncheck ./...       # известные уязвимости в toolchain �
 
 ## Сбор id из каталога (cmd/wb-search)
 
-Отдельная команда, которая открывает каталог витрины в браузере (go-rod)
-и собирает товары по запросу, выводя их в CSV с колонкой `supplier_id`. Нужна, когда
-продавцов берут по категории, а не по готовому списку id, и когда поисковый API
-отвечает 403. Это самостоятельный инструмент, он не входит в основной конвейер,
-но его CSV подаётся в `wb-sellers -ids` и в поле ввода `wb-server` без переделки.
-Использование подчиняется правилам Wildberries.
-
-Сценарий «N продавцов по запросу» целиком:
+Команда, которая открывает каталог витрины в браузере (go-rod) и собирает товары
+по запросу в CSV с колонкой `supplier_id`. В обычном сценарии её не запускают руками:
+`wb-sellers -queries` и режим «Поисковые запросы» в `wb-server` запускают её сами
+(`internal/wbsearch`), по одному запуску на запрос, и читают её CSV. Можно использовать
+и отдельно, тогда CSV подаётся в `wb-sellers -ids` или в поле ввода веб-интерфейса
+как есть. Использование подчиняется правилам Wildberries.
 
 ```bash
 go run ./cmd/wb-search -q "кроссовки мужские" -pages 3 -out out/search.csv
 go run ./cmd/wb-sellers -ids out/search.csv -limit 50 -out out/sellers.csv
-open out/sellers.csv
 ```
 
-Первая команда открывает окно браузера и собирает три страницы каталога (до 300 товаров,
-продавцы в них повторяются). Вторая берёт из CSV колонку `supplier_id`, останавливается
-на 50 уникальных продавцах и пишет их юрданные. Тот же CSV можно вставить в поле ввода
-веб-интерфейса, поле «хватит продавцов» действует и для списка id.
+В Docker-образе браузера нет, поэтому там режим поиска работает через site-mimic
+(`-engine mimic` в ENTRYPOINT), а режим списка id всегда.
 
 ## Если поиск не отвечает
 

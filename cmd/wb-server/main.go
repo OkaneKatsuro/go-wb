@@ -19,12 +19,13 @@ import (
 
 	"github.com/OkaneKatsuro/go-wb/internal/store"
 	"github.com/OkaneKatsuro/go-wb/internal/wb"
+	"github.com/OkaneKatsuro/go-wb/internal/wbsearch"
 	"github.com/OkaneKatsuro/go-wb/internal/web"
 )
 
 type config struct {
 	addr, data, profile, proxy, dest, version string
-	allowedHosts                              string
+	allowedHosts, engine, wbSearch            string
 	rps                                       int
 }
 
@@ -32,7 +33,9 @@ func main() {
 	var c config
 	flag.StringVar(&c.addr, "addr", "127.0.0.1:8080", "адрес HTTP-сервера (слушать все интерфейсы: :8080)")
 	flag.StringVar(&c.data, "data", "out", "каталог для кэша и CSV")
-	flag.StringVar(&c.profile, "profile", "windows-chrome152.json", "профиль site-mimic для режима поиска (пусто = режим выключен)")
+	flag.StringVar(&c.engine, "engine", "browser", "как искать по запросам: browser (через wb-search, окно браузера на этой машине), mimic (site-mimic по профилю) или off (режим поиска выключен)")
+	flag.StringVar(&c.wbSearch, "wb-search", "", "путь к бинарнику wb-search (пусто = рядом с wb-server, в PATH или go run из каталога модуля)")
+	flag.StringVar(&c.profile, "profile", "windows-chrome152.json", "профиль site-mimic для -engine mimic (пусто = режим выключен)")
 	flag.StringVar(&c.proxy, "proxy", "", "прокси для поиска")
 	flag.StringVar(&c.dest, "dest", "-1257786", "регион WB (dest)")
 	flag.StringVar(&c.version, "api-version", "v18", "версия поискового API")
@@ -72,14 +75,18 @@ func run(c config) error {
 		Workers:      c.rps * 2,
 		AllowedHosts: allowed,
 	}
-	switch _, err := os.Stat(c.profile); {
-	case c.profile == "":
-		slog.Info("режим поиска выключен")
-	case err != nil:
-		slog.Warn("профиль не найден, режим поиска выключен", "profile", c.profile)
-	default:
-		// Это замыкание и есть шов: верни здесь любой другой wb.Source,
-		// чтобы поменять, как находятся продавцы в режиме поиска.
+	// NewSearch — шов режима поиска: любой wb.Source по списку запросов.
+	switch c.engine {
+	case "browser":
+		cfg.NewSearch = func(queries []string, pages int) (wb.Source, error) {
+			return wbsearch.Source{Runner: wbsearch.Runner{Bin: c.wbSearch}, Queries: queries, Pages: pages}, nil
+		}
+		slog.Info("режим поиска: wb-search подпроцессом, окно браузера откроется на этой машине")
+	case "mimic":
+		if _, err := os.Stat(c.profile); c.profile == "" || err != nil {
+			slog.Warn("профиль site-mimic не найден, режим поиска выключен", "profile", c.profile)
+			break
+		}
 		cfg.NewSearch = func(queries []string, pages int) (wb.Source, error) {
 			s, err := wb.NewSearcher(c.profile, c.proxy, c.dest, c.version)
 			if err != nil {
@@ -87,6 +94,10 @@ func run(c config) error {
 			}
 			return wb.QuerySearch{Searcher: s, Queries: queries, Pages: pages}, nil
 		}
+	case "off":
+		slog.Info("режим поиска выключен")
+	default:
+		return fmt.Errorf("неизвестный -engine %q (browser, mimic или off)", c.engine)
 	}
 	app := web.New(cfg)
 	srv := &http.Server{

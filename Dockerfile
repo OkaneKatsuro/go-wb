@@ -22,4 +22,5 @@ COPY --from=build --chown=65532:65532 /out/data /data
 COPY windows-chrome152.json /profiles/wb-search.json
 VOLUME ["/data"]
 EXPOSE 8080
-ENTRYPOINT ["/wb-server", "-addr", ":8080", "-data", "/data", "-profile", "/profiles/wb-search.json"]
+# В образе нет браузера, поэтому поиск идёт через site-mimic; режим списка id работает всегда.
+ENTRYPOINT ["/wb-server", "-addr", ":8080", "-data", "/data", "-engine", "mimic", "-profile", "/profiles/wb-search.json"]

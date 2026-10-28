@@ -21,6 +21,7 @@ import (
 	"github.com/OkaneKatsuro/go-wb/internal/ofdata"
 	"github.com/OkaneKatsuro/go-wb/internal/store"
 	"github.com/OkaneKatsuro/go-wb/internal/wb"
+	"github.com/OkaneKatsuro/go-wb/internal/wbsearch"
 )
 
 // Коды выхода: 1 — ошибка, 2 — неверные флаги, 130 — остановлено сигналом (как в shell).
@@ -34,7 +35,7 @@ const (
 // поэтому дальше программа работает с обычными значениями, а не с указателями.
 type config struct {
 	queries, ids, out, idsOut, profile, proxy, dest, version, cache, dump string
-	format, ofdataKey                                                     string
+	format, ofdataKey, engine, wbSearch                                   string
 	pages, rps, limit, ofdataRps                                          int
 	searchOnly, enrich, enrichIP                                          bool
 }
@@ -53,7 +54,9 @@ func realMain() int {
 	flag.StringVar(&c.out, "out", "", "итоговый файл: out/sellers.csv или out/sellers.ndjson по формату; «-» = stdout")
 	flag.StringVar(&c.idsOut, "ids-out", "out/supplier_ids.txt", "куда записать найденные supplierId (пусто = не писать)")
 	flag.BoolVar(&c.searchOnly, "search-only", false, "только поиск, без юрданных")
-	flag.StringVar(&c.profile, "profile", "windows-chrome152.json", "профиль site-mimic для поиска")
+	flag.StringVar(&c.engine, "engine", "browser", "как искать по запросам: browser (через wb-search, окно браузера) или mimic (site-mimic по профилю)")
+	flag.StringVar(&c.wbSearch, "wb-search", "", "путь к бинарнику wb-search (пусто = рядом с wb-sellers, в PATH или go run из каталога модуля)")
+	flag.StringVar(&c.profile, "profile", "windows-chrome152.json", "профиль site-mimic для -engine mimic")
 	flag.StringVar(&c.proxy, "proxy", "", "прокси для поиска, http://user:pass@host:port")
 	flag.StringVar(&c.dest, "dest", "-1257786", "регион WB (dest)")
 	flag.StringVar(&c.version, "api-version", "v18", "версия поискового API")
@@ -108,6 +111,11 @@ func (c *config) validate() error {
 	if c.out == "" {
 		c.out = "out/sellers." + c.format
 	}
+	switch c.engine {
+	case "browser", "mimic":
+	default:
+		return fmt.Errorf("неизвестный -engine %q (browser или mimic)", c.engine)
+	}
 	if c.enrich && c.ofdataKey == "" {
 		c.ofdataKey = os.Getenv("OFDATA_KEY")
 	}
@@ -144,12 +152,14 @@ func run(ctx context.Context, c config) error {
 		if err != nil {
 			return err
 		}
-		s, err := wb.NewSearcher(c.profile, c.proxy, c.dest, c.version)
-		if err != nil {
-			return fmt.Errorf("site-mimic: %w", err)
+		if len(queries) == 0 {
+			return fmt.Errorf("в %s нет ни одного запроса", c.queries)
 		}
-		s.DumpPath = c.dump
-		sources = append(sources, wb.QuerySearch{Searcher: s, Queries: queries, Pages: c.pages})
+		src, err := newQuerySource(c, queries)
+		if err != nil {
+			return err
+		}
+		sources = append(sources, src)
 	}
 
 	cache, err := store.Load(c.cache)
@@ -222,6 +232,21 @@ func run(ctx context.Context, c config) error {
 	}
 	slog.Info("готово", "rows", n, "file", c.out, "failed", res.Failed, "enrichFailed", res.EnrichFailed)
 	return nil
+}
+
+// newQuerySource строит источник для поиска по запросам согласно -engine.
+// browser: cmd/wb-search подпроцессом (открывает окно браузера), один запуск на
+// запрос; mimic: поисковый API через site-mimic с профилем браузера.
+func newQuerySource(c config, queries []string) (wb.Source, error) {
+	if c.engine == "mimic" {
+		s, err := wb.NewSearcher(c.profile, c.proxy, c.dest, c.version)
+		if err != nil {
+			return nil, fmt.Errorf("site-mimic: %w", err)
+		}
+		s.DumpPath = c.dump
+		return wb.QuerySearch{Searcher: s, Queries: queries, Pages: c.pages}, nil
+	}
+	return wbsearch.Source{Runner: wbsearch.Runner{Bin: c.wbSearch}, Queries: queries, Pages: c.pages}, nil
 }
 
 // openOut возвращает writer для вывода: stdout при "-", иначе файл.
