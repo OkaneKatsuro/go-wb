@@ -48,8 +48,8 @@ echo "страница 1: 2 товара (pages=$pages)"`)
 	if len(hits) != 2 || hits[0] != want[0] || hits[1] != want[1] {
 		t.Fatalf("hits = %+v", hits)
 	}
-	if left, _ := filepath.Glob(filepath.Join(r.Dir, "wb-search-*.csv")); len(left) != 0 {
-		t.Fatalf("временный CSV должен удаляться: %v", left)
+	if left, _ := filepath.Glob(filepath.Join(r.Dir, "wb-search-*")); len(left) != 0 {
+		t.Fatalf("временный каталог должен удаляться: %v", left)
 	}
 }
 

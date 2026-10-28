@@ -31,7 +31,7 @@ type Runner struct {
 	// файлом, затем в PATH, затем `go run ./cmd/wb-search`, если запуск идёт
 	// из каталога модуля.
 	Bin string
-	// Dir — куда класть временные CSV, "" = системный temp.
+	// Dir — где создавать временный каталог под CSV, "" = системный temp.
 	Dir string
 }
 
@@ -67,12 +67,14 @@ func fileExists(p string) bool {
 // Collect запускает wb-search по одному запросу и отдаёт продавцов из его CSV.
 // Отмена ctx завершает подпроцесс (SIGTERM, через 5 с SIGKILL).
 func (r *Runner) Collect(ctx context.Context, query string, maxPages int, emit func(wb.SellerHit)) error {
-	dir := r.Dir
-	if dir == "" {
-		dir = os.TempDir()
+	// Приватный каталог (0700) с непредсказуемым именем: в общем temp файл с
+	// угадываемым именем можно подменить symlink-ом до того, как wb-search его запишет.
+	dir, err := os.MkdirTemp(r.Dir, "wb-search-*")
+	if err != nil {
+		return fmt.Errorf("временный каталог: %w", err)
 	}
-	tmp := filepath.Join(dir, fmt.Sprintf("wb-search-%d.csv", time.Now().UnixNano()))
-	defer func() { _ = os.Remove(tmp) }()
+	defer func() { _ = os.RemoveAll(dir) }()
+	tmp := filepath.Join(dir, "search.csv")
 
 	cmd, err := r.command(ctx, "-q", query, "-pages", strconv.Itoa(max(maxPages, 1)), "-out", tmp)
 	if err != nil {
