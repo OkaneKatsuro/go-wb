@@ -21,6 +21,7 @@ var (
 	enrichHeader = []string{
 		"of_kind", "of_shortName", "of_fullName", "of_ogrn", "of_status", "of_regDate",
 		"of_address", "of_okvedCode", "of_okvedName", "of_director",
+		"of_phones", "of_emails", "of_website", // несколько значений через «; »
 	}
 	csvHeader = append(append([]string{}, baseHeader...), enrichHeader...)
 )
@@ -143,6 +144,7 @@ func enrichColumns(e *wb.Enrichment) []string {
 	return []string{
 		e.Kind, e.ShortName, e.FullName, e.OGRN, e.Status, e.RegDate,
 		e.Address, e.OkvedCode, e.OkvedName, e.Director,
+		strings.Join(e.Phones, "; "), strings.Join(e.Emails, "; "), e.Website,
 	}
 }
 

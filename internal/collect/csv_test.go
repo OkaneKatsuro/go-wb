@@ -64,7 +64,7 @@ func TestExcelWriterSanitizesAndKeepsRow(t *testing.T) {
 
 func TestCSVRowWidthMatchesHeader(t *testing.T) {
 	cache, _ := store.Load(filepath.Join(t.TempDir(), "c.json"))
-	cache.Put(&wb.Supplier{ID: 1, Name: "A", Enrich: &wb.Enrichment{Kind: "ЮЛ", Director: "Иванов"}})
+	cache.Put(&wb.Supplier{ID: 1, Name: "A", Enrich: &wb.Enrichment{Kind: "ЮЛ", Director: "Иванов", Phones: []string{"+7", "+8"}}})
 	cache.Put(&wb.Supplier{ID: 2, Name: "B", Enrich: &wb.Enrichment{NotFound: true}})
 	// id 3 в кэше нет вовсе
 	for _, id := range []int{1, 2, 3} {
@@ -75,6 +75,10 @@ func TestCSVRowWidthMatchesHeader(t *testing.T) {
 	row := csvRow(2, wb.SellerHit{}, cache)
 	if row[len(baseHeader)] != "" {
 		t.Fatalf("при NotFound колонки обогащения пустые, got %q", row[len(baseHeader):])
+	}
+	row = csvRow(1, wb.SellerHit{}, cache)
+	if got := row[len(baseHeader)+10]; got != "+7; +8" {
+		t.Fatalf("телефоны через «; »: %q", got)
 	}
 }
 

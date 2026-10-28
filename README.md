@@ -188,7 +188,8 @@ Excel открыл кириллицу; ячейки, начинающиеся с
 Колонки: `supplierId, supplierName, supplierFullName, inn, ogrn, kpp, legalAddress,
 trademark, taxpayerCode, supplierRating, deactivated, notFound, source_query, sellerType`
 и колонки обогащения `of_kind, of_shortName, of_fullName, of_ogrn, of_status, of_regDate,
-of_address, of_okvedCode, of_okvedName, of_director` (пустые без `-enrich`).
+of_address, of_okvedCode, of_okvedName, of_director, of_phones, of_emails, of_website`
+(пустые без `-enrich`; несколько телефонов или адресов разделены `; `).
 
 `-format ndjson` отдаёт по одному JSON-объекту на строку **по мере готовности** продавца
 (файл по умолчанию `out/sellers.ndjson`, `-out -` для stdout). Логи идут в stderr, данные
@@ -201,10 +202,11 @@ of_address, of_okvedCode, of_okvedName, of_director` (пустые без `-enri
 
 ## Обогащение из реестра (OFData)
 
-Юрданные с CDN дают ИНН. Флаг `-enrich` по этому ИНН дотягивает из ЕГРЮЛ/ЕГРИП через
-[OFData](https://ofdata.ru) статус, дату регистрации, полное наименование, адрес,
-основной ОКВЭД и руководителя. Эндпоинт выбирается по длине ИНН: 10 цифр — юрлицо,
-12 — ИП.
+Юрданные с CDN дают ИНН, но не контакты: WB телефоны и почту продавцов не публикует.
+Флаг `-enrich` по ИНН дотягивает из ЕГРЮЛ/ЕГРИП через [OFData](https://ofdata.ru)
+статус, дату регистрации, полное наименование, адрес, основной ОКВЭД, руководителя,
+а также телефоны, электронную почту и сайт из блока «Контакты» (если реестр их знает).
+Эндпоинт выбирается по длине ИНН: 10 цифр — юрлицо, 12 — ИП.
 
 - `-enrich` включает обогащение, `-enrich-ip` добавляет ИП (по умолчанию ИП пропускаются).
 - Ключ берётся из `OFDATA_KEY` или флага `-ofdata-key`; без ключа запуск с `-enrich`

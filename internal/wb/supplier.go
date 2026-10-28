@@ -63,7 +63,11 @@ type Enrichment struct {
 	OkvedCode  string `json:"okvedCode,omitempty"`  // основной ОКВЭД, код
 	OkvedName  string `json:"okvedName,omitempty"`  // основной ОКВЭД, название
 	Director   string `json:"director,omitempty"`   // руководитель (ЮЛ) или сам ИП
-	Source     string `json:"source"`               // источник, напр. "ofdata"
+	// Контакты из реестра и открытых источников OFData; WB их не публикует.
+	Phones  []string `json:"phones,omitempty"`
+	Emails  []string `json:"emails,omitempty"`
+	Website string   `json:"website,omitempty"`
+	Source  string   `json:"source"` // источник, напр. "ofdata"
 	// NotFound — реестр ответил, что записи по этому ИНН нет. Запись с NotFound
 	// хранится в кэше, чтобы повторный прогон не платил за тот же запрос снова.
 	NotFound bool `json:"notFound,omitempty"`

@@ -77,6 +77,7 @@ type apiResp struct {
 		ОКВЭД    kodNaim   `json:"ОКВЭД"`
 		ОКОПФ    kodNaim   `json:"ОКОПФ"`
 		Руковод  []руковод `json:"Руковод"`
+		Контакты *контакты `json:"Контакты"`
 	} `json:"data"`
 	Meta struct {
 		Status  string  `json:"status"`
@@ -106,6 +107,13 @@ type адрес struct {
 }
 type руковод struct {
 	ФИО string `json:"ФИО"`
+}
+
+// контакты — телефоны, почта и сайт; у ИП блок тот же, но может отсутствовать.
+type контакты struct {
+	Тел     []string `json:"Тел"`
+	Емэйл   []string `json:"Емэйл"`
+	ВебСайт string   `json:"ВебСайт"`
 }
 
 // Enrich возвращает обогащение по ИНН. Если записи в реестре нет, возвращает
@@ -218,6 +226,18 @@ func (c *Client) fetch(ctx context.Context, method, inn string) (*wb.Enrichment,
 	}
 }
 
+// cleanList подрезает пробелы и выбрасывает пустые строки; пустой список — nil,
+// чтобы в JSON он не появлялся.
+func cleanList(in []string) []string {
+	var out []string
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func notFound() *wb.Enrichment {
 	return &wb.Enrichment{Source: sourceName, NotFound: true}
 }
@@ -244,6 +264,11 @@ func mapEnrichment(method string, r *apiResp) *wb.Enrichment {
 		OkvedCode:  d.ОКВЭД.Код,
 		OkvedName:  d.ОКВЭД.Наим,
 		Source:     sourceName,
+	}
+	if c := d.Контакты; c != nil {
+		e.Phones = cleanList(c.Тел)
+		e.Emails = cleanList(c.Емэйл)
+		e.Website = strings.TrimSpace(c.ВебСайт)
 	}
 	if method == "entrepreneur" {
 		e.Kind = "ИП"
