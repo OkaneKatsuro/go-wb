@@ -53,15 +53,3 @@ jobs:
         with:
           go-version-file: go.mod
           go-package: ./...
-
-  docker:
-    name: Docker image builds
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          tags: wb-server:ci

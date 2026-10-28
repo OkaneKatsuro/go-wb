@@ -1,5 +1,5 @@
-// Пакет wb общается с Wildberries: поисковый API (через site-mimic)
-// и публичный CDN с юридическими данными продавцов.
+// Пакет wb — предметная область Wildberries: продавец, источник продавцов,
+// клиент публичного CDN с юридическими данными.
 package wb
 
 import (
@@ -73,7 +73,7 @@ func (m Multi) Collect(ctx context.Context, emit func(SellerHit)) error {
 }
 
 // QuerySearcher умеет пройти страницы одного запроса и отдать продавцов.
-// Реализации: *Searcher (site-mimic) и wbsearch.Runner (cmd/wb-search подпроцессом).
+// Реализация — wbsearch.Runner (cmd/wb-search подпроцессом).
 type QuerySearcher interface {
 	Collect(ctx context.Context, query string, maxPages int, emit func(SellerHit)) error
 }
@@ -81,8 +81,7 @@ type QuerySearcher interface {
 // QuerySearch прогоняет Searcher по нескольким запросам.
 //
 // Упавший запрос логируется и пропускается, а в конце Collect возвращает
-// ErrQueriesSkipped со сводкой. ErrChallenge останавливает весь прогон,
-// потому что каждый следующий запрос получил бы тот же ответ.
+// ErrQueriesSkipped со сводкой.
 type QuerySearch struct {
 	Searcher QuerySearcher
 	Queries  []string
@@ -96,9 +95,6 @@ func (q QuerySearch) Collect(ctx context.Context, emit func(SellerHit)) error {
 		err := q.Searcher.Collect(ctx, query, q.Pages, emit)
 		if ctx.Err() != nil {
 			return ctx.Err()
-		}
-		if errors.Is(err, ErrChallenge) {
-			return err
 		}
 		if err != nil {
 			slog.Warn("запрос пропущен", "query", query, "err", err)

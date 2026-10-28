@@ -1,305 +1,287 @@
 # wb-sellers
 
-Собирает юридические данные продавцов Wildberries: название, ИНН, ОГРН, КПП, адрес.
-Источник данных — публичный CDN WB, который отдаёт JSON по `supplierId`
-(`static-basket-01.wbbasket.ru/vol0/data/supplier-by-id/{id}.json`, каталог всегда `vol0`).
-Откуда брать сами `supplierId`, решает подключаемый источник: готовый список, поиск по запросам или что-то своё.
-
-Типичный сценарий: задаёшь список id или поисковые запросы (категории) и, по желанию,
-сколько продавцов нужно (`-limit`). На выходе юрданные этих продавцов, при желании
-обогащённые из реестра ЕГРЮЛ/ЕГРИП через OFData (`-enrich`). Одной командой:
+Собирает юридические данные продавцов Wildberries по поисковому запросу или по
+списку `supplierId`: название, ИНН, ОГРН, КПП, адрес, при желании статус и ОКВЭД из
+ЕГРЮЛ/ЕГРИП через OFData. Одна команда от запроса до таблицы:
 
 ```bash
-go run ./cmd/wb-sellers -queries queries.txt -limit 20 -out out/sellers.csv
+go run ./cmd/wb-sellers -queries queries.txt -limit 50 -out out/sellers.csv
 ```
 
-Поиск по запросам идёт через `wb-search`: конвейер сам запускает его по каждому запросу
-(на экране откроется окно браузера), забирает найденных продавцов и дальше работает как
-со списком id. Отдельных шагов и промежуточных файлов нет.
+На экране откроется окно браузера: по каждому запросу конвейер сам запускает
+`wb-search`, который листает каталог витрины как обычный пользователь. Найденные
+продавцы идут дальше по конвейеру: публичный CDN WB отдаёт по `supplierId` юрданные,
+они кэшируются и записываются в CSV или потоком в NDJSON.
 
-Два бинарника на одном ядре:
+## Быстрый старт
 
-- `wb-sellers` — CLI: список id или запросы на входе, CSV или поток NDJSON на выходе.
-- `wb-server` — веб-интерфейс: вставил ввод, нажал «Запустить», смотришь прогресс, скачиваешь CSV.
-  Обогащение OFData в нём пока не включается, это только CLI.
+Нужны Go 1.26 и Chrome или Chromium на этой машине (если браузер не найден, go-rod
+скачает его сам при первом запуске).
 
-## Структура проекта
+```bash
+git clone https://github.com/OkaneKatsuro/go-wb.git && cd go-wb
 
-```
-cmd/wb-sellers/      CLI: флаги, сигналы, вызов конвейера
-cmd/wb-server/       HTTP-сервер: точка входа, graceful shutdown
-cmd/wb-search/       поиск товаров по запросу через браузер (go-rod); конвейер запускает его сам
-internal/wbsearch/   wb.Source поверх cmd/wb-search: подпроцесс на запрос, разбор его CSV
-internal/wb/         предметная область: Source, SellerHit, Supplier, HTTP-клиенты
-internal/store/      Cache: память + JSON-файл, безопасен для горутин
-internal/collect/    конвейер Runner: источник → пул воркеров → CSV/NDJSON
-internal/ofdata/     обогащение из реестра OFData (ЕГРЮЛ/ЕГРИП)
-internal/web/        HTTP-обработчики, SSE, страница (html/template + embed)
-Dockerfile           multi-stage, distroless, итоговый образ ~17 МБ
-.github/workflows/   CI: сборка, vet, тесты -race, golangci-lint, govulncheck, docker build
-.golangci.yml        набор линтеров и осознанные исключения
+# 1. Запросы, по одному на строку (пример уже лежит в репозитории)
+cat queries.txt
+
+# 2. Запуск: 50 уникальных продавцов по этим запросам
+go run ./cmd/wb-sellers -queries queries.txt -limit 50 -out out/sellers.csv
+
+# 3. Результат
+open out/sellers.csv
 ```
 
-Зависимости между пакетами направлены строго вниз, циклов нет.
-Показаны только прямые рёбра: `cmd/*` и `web` импортируют ещё `store` и `wb`, но это уже следует из схемы.
+Что происходит во время запуска, видно в логе (stderr): запуск `wb-search`, получение
+сессии, страницы каталога, затем счётчик юрданных и итог `готово rows=N`.
+
+Другие типичные команды:
+
+```bash
+# По готовому списку id или ссылок на продавца (пример ids.txt в репозитории)
+go run ./cmd/wb-sellers -ids ids.txt -out out/sellers.csv
+
+# Больше страниц каталога на запрос (по 100 товаров на странице, продавцы повторяются)
+go run ./cmd/wb-sellers -queries queries.txt -pages 5 -limit 200
+
+# С обогащением из реестра ЕГРЮЛ/ЕГРИП (нужен ключ OFData)
+export OFDATA_KEY=...
+go run ./cmd/wb-sellers -queries queries.txt -limit 50 -enrich -enrich-ip
+
+# Поток NDJSON в другую программу по мере готовности каждого продавца
+go run ./cmd/wb-sellers -queries queries.txt -format ndjson -out - | ваше-приложение
+```
+
+Полный список флагов: `go run ./cmd/wb-sellers -h`.
+
+## Процесс целиком
 
 ```mermaid
 flowchart TD
-    srv["cmd/wb-server"] --> web["internal/web<br/>HTTP, SSE, UI"]
-    cli["cmd/wb-sellers"] --> collect
-    cli --> wbsearch["internal/wbsearch<br/>cmd/wb-search подпроцессом"]
-    srv --> wbsearch
-    wbsearch --> wb
-    web --> collect["internal/collect<br/>Runner, CSV"]
-    collect --> store["internal/store<br/>Cache"]
-    collect --> wb["internal/wb<br/>типы, интерфейс Source, HTTP-клиенты"]
-    store --> wb
-```
+    Q["queries.txt<br/>запросы по одному на строку"] --> CLI["cmd/wb-sellers"]
+    I["ids.txt<br/>id, ссылки или CSV с supplier_id"] --> CLI
+    CLI --> RUN["collect.Runner.Run(ctx)"]
 
-## Как это работает
-
-### 1. Поток данных целиком
-
-Оба бинарника строят `wb.Source`, отдают его в `collect.Runner` и забирают результат.
-Runner не знает, откуда пришли id, а источник не знает, что с ними будет дальше.
-
-```mermaid
-flowchart TD
-    CLI["cmd/wb-sellers<br/>флаги → config → run()"]
-    SRV["cmd/wb-server<br/>браузер → POST /api/start"]
-
-    subgraph SOURCE["wb.Source — интерфейс с одним методом Collect(ctx, emit)"]
-        IDL["IDList / HitList<br/>готовый список id или CSV wb-search"]
-        QS["QuerySearch<br/>по запросам через QuerySearcher:<br/>wbsearch.Runner (браузер) или Searcher (site-mimic)"]
-        MULTI["Multi<br/>несколько источников подряд"]
+    subgraph SOURCE["wb.Source — этап сбора supplierId"]
+        WS["wbsearch.Source<br/>на каждый запрос: подпроцесс wb-search"]
+        BR["cmd/wb-search<br/>окно браузера (go-rod)<br/>страница поиска → страницы каталога → CSV"]
+        HL["wb.HitList<br/>готовый список"]
+        WS -. "запуск, ожидание, разбор CSV" .-> BR
     end
 
-    CLI --> MULTI
-    MULTI --> IDL
-    MULTI --> QS
-    SRV --> IDL
-    SRV --> QS
-
-    SOURCE -->|"emit(SellerHit) — по одному продавцу"| RUN
-
-    subgraph RUN["collect.Runner.Run(ctx)"]
-        direction TB
-        H["1. Hits[id] = hit<br/>map убирает дубли<br/>при Limit: на N-м уникальном останавливает сбор"]
-        I["2. IDs = отсортированные ключи<br/>порядок обхода map случайный"]
-        T["3. todo = id без юрданных в кэше<br/>или ещё не обогащённые (при -enrich)"]
-        F["4. fetchAll(ctx, todo)<br/>пул воркеров, схема 2:<br/>юрданные + обогащение"]
-        S["5. Cache.Save()<br/>даже после отмены"]
-        H --> I --> T --> F --> S
-    end
-
-    RUN --> CACHE["store.Cache<br/>map[int]*Supplier + RWMutex<br/>JSON-файл, атомарная запись .tmp → rename<br/>notFound перепроверяется через 7 дней"]
-    RUN --> CSV["collect.WriteCSV (колонки of_*)<br/>или поток NDJSON через OnRecord"]
-    F -.->|"Get(ctx, id)"| CDN["CDN Wildberries<br/>vol0/data/supplier-by-id/ID.json"]
-    F -.->|"Enrich(ctx, inn) при -enrich"| OFD["OFData<br/>/v2/company или /v2/entrepreneur"]
+    RUN --> SOURCE
+    SOURCE -->|"emit(SellerHit) по одному продавцу"| DEDUP["map по supplierId: дубли схлопываются<br/>при -limit N сбор останавливается на N-м"]
+    DEDUP --> POOL["пул воркеров: юрданные<br/>кэш → CDN → (OFData) → кэш"]
+    POOL -.->|"GET vol0/data/supplier-by-id/ID.json"| CDN["CDN Wildberries"]
+    POOL -.->|"при -enrich: /v2/company или /v2/entrepreneur по ИНН"| OFD["OFData"]
+    POOL --> CACHE["out/cache.json<br/>атомарная запись, переживает запуски"]
+    POOL --> OUT["CSV в конце (отсортирован)<br/>или NDJSON сразу по готовности"]
 ```
 
-### 2. Пул воркеров внутри `fetchAll`
+### 1. Сбор продавцов: `wb-search` подпроцессом
 
-Три роли и два канала. Главная горутина создаёт каналы и ждёт результаты.
-Производитель кладёт id в `jobs`. Воркеры читают `jobs`, ходят в сеть и пишут в `results`.
+`internal/wbsearch` запускает `cmd/wb-search -q <запрос> -pages <N> -out <временный CSV>`
+по каждому запросу из файла. `wb-search` открывает окно браузера, заходит на страницу
+поиска витрины как пользователь, дожидается сессии и запрашивает страницы каталога
+изнутри той же страницы, поэтому заголовки и cookie подставляет сам браузер. Результат он
+пишет в CSV с колонками `supplier_id`, `supplier`, `query`; конвейер читает их и отдаёт
+каждого продавца в `Runner`. Временный CSV лежит в приватном каталоге и удаляется.
+
+Где искать `wb-search`, решается так: путь из `-wb-search`; бинарник рядом с `wb-sellers`;
+`wb-search` в PATH; при запуске из каталога модуля — `go run ./cmd/wb-search`. Для
+собранного `wb-sellers` положите рядом `go build ./cmd/wb-search`.
+
+Упавший запрос (ошибка браузера, пустая сессия) логируется и пропускается, остальные
+выполняются, а итог помечается предупреждением `прогон завершён с предупреждением`.
+«Готово, 0 продавцов» без предупреждения означает, что запросы действительно ничего
+не вернули.
+
+Остановка по `-limit` или Ctrl+C гасит подпроцесс вместе с браузером: сигнал уходит
+всей группе процессов.
+
+### 2. Остановка по количеству
+
+`-limit N` останавливает сбор, как только набрано `N` уникальных продавцов. Контекст
+сбора отменяется, `wb-search` завершается, а этап юрданных на исходном контексте
+качает данные только по этим `N`. Повторяющиеся `supplierId` (у продавца много товаров)
+схлопываются ещё до CDN. Если источник отдал страницу целиком, лишнее после `N`
+отбрасывается: собирается ровно `N`.
+
+### 3. Юрданные: пул воркеров
 
 ```mermaid
 flowchart TB
     subgraph MAIN["Run — главная горутина"]
         direction LR
-        M1["создать jobs и results<br/>запустить N воркеров (wg.Go)<br/>запустить производителя"]
-        M2["for pr := range results<br/>Failed++ / EnrichFailed++<br/>ошибка OnRecord → cancel()<br/>каждые 200 → Cache.Save()<br/>OnProgress(done, total)"]
-        M3["return ctx.Err()"]
-        M1 --> M2 --> M3
+        M1["создать jobs и results<br/>запустить N воркеров<br/>запустить производителя"]
+        M2["for pr := range results<br/>Failed++ / EnrichFailed++<br/>ошибка OnRecord или ключа OFData → cancel()<br/>каждые 200 → Cache.Save()<br/>OnProgress(done, total)"]
+        M1 --> M2
     end
 
-    subgraph PROD["производитель — go func"]
+    subgraph PROD["производитель"]
         direction LR
-        P1["for id := range todo"]
-        P2{"select"}
-        P3["jobs &lt;- id"]
-        P4["ctx.Done() → break"]
-        P5["close(jobs)<br/>wg.Wait()<br/>close(results)"]
-        P1 --> P2
-        P2 --> P3 --> P1
-        P2 --> P4 --> P5
+        P1["for id := range todo"] --> P2{"select"}
+        P2 --> P3["jobs ← id"] --> P1
+        P2 --> P4["ctx.Done()"] --> P5["close(jobs)<br/>wg.Wait()<br/>close(results)"]
     end
 
-    subgraph WORK["воркеры × N — process(id)"]
+    subgraph WORK["воркеры × N"]
         direction LR
         W1["for id := range jobs"]
-        W2["юрданные: из кэша или<br/>Client.Get (&lt;-tick.C, лимит rps)"]
+        W2["юрданные: из кэша или<br/>Client.Get (rate.Limiter, повторы при 429/5xx)"]
         W3["при -enrich и ИНН из 10/12 цифр:<br/>Enricher.Enrich (OFData)<br/>результат в копию, объект кэша не меняется"]
         W4["Cache.Put(s)"]
-        W5["OnRecord → поток NDJSON<br/>results &lt;- итог: ошибка юрданных,<br/>обогащения или вывода"]
+        W5["OnRecord → поток NDJSON<br/>results ← итог"]
         W1 --> W2 --> W3 --> W4 --> W5 --> W1
     end
 
     M1 -.-> P1
     M1 -.-> W1
-    P3 ==>|"jobs: chan int, без буфера"| W1
+    P3 ==>|"jobs: chan int"| W1
     W5 ==>|"results: chan procResult"| M2
 ```
 
-Почему это не зависает при отмене: производитель видит `ctx.Done()`, перестаёт класть в `jobs` и закрывает его.
-Воркеры дочитывают канал до конца и выходят из `range`. `wg.Wait()` отпускает производителя, тот закрывает `results`,
-и цикл `range results` в главной горутине завершается сам. Ни один `send` не остаётся без получателя.
-Объекты в кэше после `Put` не меняются: воркер, дописывающий обогащение, кладёт копию. Иначе `Cache.Save`,
-который читает кэш из главной горутины, гонялся бы с воркерами за одно и то же поле.
+Почему это не зависает при отмене: производитель видит `ctx.Done()`, перестаёт класть
+в `jobs` и закрывает его. Воркеры дочитывают канал и выходят. `wg.Wait()` отпускает
+производителя, тот закрывает `results`, и цикл в главной горутине завершается сам.
+Объекты в кэше после `Put` не меняются: воркер, дописывающий обогащение, кладёт копию,
+иначе `Cache.Save` из главной горутины гонялся бы с воркерами за одно поле.
 
-### 3. Веб-сервер: один запуск задачи глазами браузера
+CDN: `static-basket-01.wbbasket.ru/vol0/data/supplier-by-id/{id}.json`, каталог всегда
+`vol0`. 404 означает, что продавца нет (например, у физлиц с `sellerType: C2C` юрданных
+нет); такая пометка кэшируется с датой и перепроверяется через 7 дней.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant B as Браузер
-    participant S as web.Server
-    participant R as collect.Runner
-    participant C as CDN
-
-    B->>S: GET /
-    S-->>B: страница из html/template (embed)
-    B->>S: GET /events (EventSource)
-    Note over S: каждые 500 мс сверяет State.Version<br/>и шлёт data: State в JSON, если он изменился
-
-    B->>S: POST /api/start (mode, input, pages)
-    alt задача уже выполняется
-        S-->>B: 409 Conflict
-    else свободно
-        S->>S: ParseLines → Source<br/>start(): новый job, ctx с cancel
-        S-->>B: 202 Accepted + State
-        S->>R: go run(ctx) → Runner.Run(ctx)
-        loop каждый id из todo
-            R->>C: GET supplier-by-id/ID.json
-            C-->>R: 200 JSON или 404
-            R->>S: OnProgress → update(job) → Version++
-            S-->>B: SSE data: State
-        end
-        R-->>S: Result → WriteCSVFile, Running = false
-        S-->>B: SSE stage = done, rows, sellers
-    end
-
-    B->>S: POST /api/cancel
-    S->>R: job.cancel() → ctx отменён
-    R-->>S: ctx.Err(), кэш сохранён
-    S-->>B: SSE stage = cancelled
-
-    B->>S: GET /download
-    S-->>B: text/csv из результата и кэша
-```
-
-### 4. Состояния задачи
-
-Это поле `State.Stage`, которое видит интерфейс.
-
-```mermaid
-stateDiagram-v2
-    [*] --> search : POST /api/start
-    search --> legal : id собраны
-    search --> cancelled : cancel или SIGTERM
-    search --> legal : часть запросов не выполнилась (403, 429) — Warning
-    search --> error : источник вернул ошибку
-    legal --> done : все id обработаны, CSV записан
-    legal --> cancelled : cancel или SIGTERM (кэш сохранён)
-    legal --> error : не удалось сохранить кэш или записать поток NDJSON
-    done --> [*]
-    cancelled --> [*]
-    error --> [*]
-```
-
-### 5. Остановка сервера без потери данных
-
-Порядок важен: сначала гасится задача, потом освобождаются SSE-потоки, и только потом сервер перестаёт принимать соединения.
-Иначе `Shutdown` ждал бы вечно открытые `/events`.
+### 4. Один `ctx` на всё
 
 ```mermaid
 flowchart TD
-    SIG["Ctrl+C или SIGTERM<br/>(docker stop)"] --> NC["signal.NotifyContext<br/>отменяет корневой ctx"]
-    NC --> STOP["app.Stop()"]
-    STOP --> S1["job.cancel()<br/>пул воркеров сворачивается"]
-    S1 --> S2["ожидание close(job.finished)<br/>Runner уже сохранил кэш"]
-    S2 --> S3["close(done)<br/>SSE-обработчики выходят из цикла"]
-    S3 --> SH["srv.Shutdown(15 с)<br/>новые соединения не принимаются,<br/>текущие запросы дорабатывают"]
-    SH --> SAVE["cache.Save() ещё раз"]
-    SAVE --> EXIT["выход с кодом 0"]
-```
-
-### 6. Один `ctx` на всё
-
-Корневой `ctx` создаётся один раз наверху. Отмена в любой точке доходит до каждого
-`select`, каждого `sleep` и каждого HTTP-запроса. У этапа сбора свой дочерний
-`collectCtx`: при достижении `-limit` его отменяют, и сбор останавливается, а этап
-юрданных на исходном `ctx` не прерывается. Родительский `ctx` (Ctrl+C, SIGTERM)
-гасит оба.
-
-```mermaid
-flowchart TD
-    A["main: signal.NotifyContext<br/>web.start: context.WithCancel"] --> B["Runner.Run(ctx)"]
+    A["main: signal.NotifyContext (Ctrl+C, SIGTERM)"] --> B["Runner.Run(ctx)"]
     B --> CC["collectCtx := WithCancel(ctx)<br/>отдельный для сбора"]
     B -. "набрано N → stopCollect()" .-> CC
-    CC --> C["Source.Collect(collectCtx, emit)"]
-    C --> H["Searcher.fetchPage(collectCtx)"]
+    CC --> C["wbsearch.Source.Collect(collectCtx)"]
+    C --> P["подпроцесс wb-search<br/>SIGTERM группе при отмене"]
     B --> D["fetchAll(ctx, todo)<br/>исходный ctx, лимит его не трогает"]
-    D --> E["Client.Get(ctx, id)"]
-    D --> E2["Enricher.Enrich(ctx, inn)<br/>при -enrich"]
-    E --> F["http.NewRequestWithContext"]
-    E --> G["sleep(ctx, d) между ретраями"]
-    E2 --> F
-    H --> F
-    H --> G
+    D --> E["Client.Get(ctx, id) → CDN"]
+    D --> E2["Enricher.Enrich(ctx, inn) → OFData"]
 ```
 
-## Запуск
+Отмена в любой точке доходит до каждого `select`, каждой паузы и каждого HTTP-запроса.
+Кэш сохраняется и после отмены: всё полученное к этому моменту остаётся. Код выхода
+при Ctrl+C — 130, при ошибке — 1, при неверных флагах — 2.
+
+## Входные данные
+
+- `queries.txt` — поисковые запросы, по одному на строку. Строки с `#` пропускаются.
+- `ids.txt` — `supplierId` по одному на строку, ссылки вида
+  `https://www.wildberries.ru/seller/12345`, либо CSV с колонкой `supplier_id`
+  (например, вывод `wb-search`, запущенного вручную). Пример в репозитории покрывает
+  все случаи: продавец без российского ИНН, юрлицо, ИП и отсутствующий на CDN.
+- `-queries` и `-ids` можно задать вместе: список id идёт первым, затем поиск.
+
+## Выход
+
+`-format csv` (по умолчанию) собирает всё и в конце пишет отсортированный по `supplierId`
+CSV в `-out` (по умолчанию `out/sellers.csv`). Файл пишется во временный и
+переименовывается, недописанного CSV по этому пути не бывает. В начале стоит BOM, чтобы
+Excel открыл кириллицу; ячейки, начинающиеся с `=`, `+`, `-`, `@`, экранируются от
+инъекции формул (отрицательные числа не трогаются).
+
+Колонки: `supplierId, supplierName, supplierFullName, inn, ogrn, kpp, legalAddress,
+trademark, taxpayerCode, supplierRating, deactivated, notFound, source_query, sellerType`
+и колонки обогащения `of_kind, of_shortName, of_fullName, of_ogrn, of_status, of_regDate,
+of_address, of_okvedCode, of_okvedName, of_director` (пустые без `-enrich`).
+
+`-format ndjson` отдаёт по одному JSON-объекту на строку **по мере готовности** продавца
+(файл по умолчанию `out/sellers.ndjson`, `-out -` для stdout). Логи идут в stderr, данные
+в stdout, поток не загрязняется. Если поток вывода сломался (читающий процесс
+завершился, диск кончился), прогон останавливается с ошибкой, кэш сохранён; это касается
+и `| head`: SIGPIPE игнорируется и превращается в обычную ошибку записи.
+
+`-ids-out` (по умолчанию `out/supplier_ids.txt`) получает все найденные `supplierId`,
+`-search-only` останавливает после сбора, без юрданных.
+
+## Обогащение из реестра (OFData)
+
+Юрданные с CDN дают ИНН. Флаг `-enrich` по этому ИНН дотягивает из ЕГРЮЛ/ЕГРИП через
+[OFData](https://ofdata.ru) статус, дату регистрации, полное наименование, адрес,
+основной ОКВЭД и руководителя. Эндпоинт выбирается по длине ИНН: 10 цифр — юрлицо,
+12 — ИП.
+
+- `-enrich` включает обогащение, `-enrich-ip` добавляет ИП (по умолчанию ИП пропускаются).
+- Ключ берётся из `OFDATA_KEY` или флага `-ofdata-key`; без ключа запуск с `-enrich`
+  отклоняется сразу. В репозиторий ключ не коммитится, в логи и ошибки не попадает.
+- Обогащается только российский ИНН из 10 или 12 цифр. У продавцов из Беларуси и
+  Казахстана УНП/БИН, в ЕГРЮЛ их нет, запрос за них не уходит.
+- Обогащение кэшируется вместе с юрданными, повторный запуск не платит снова. Ответ
+  «в реестре нет» тоже кэшируется (`notFound` внутри `enrich`).
+- Ошибка API (баланс, неверный запрос) в кэш не пишется и считается в `enrichFailed`;
+  следующий прогон попробует снова. Отклонённый ключ (401/403) останавливает весь
+  прогон с ошибкой: юрданные уже в кэше, после исправления ключа их обогатят без CDN.
+
+## Кэш
+
+`out/cache.json` хранит юрданные и обогащение; повторный запуск не ходит в сеть за тем,
+что уже есть. Сохраняется каждые 200 продавцов и в конце, в том числе после отмены.
+Запись атомарная: временный файл, fsync, rename.
+
+## Флаги wb-sellers
+
+| Флаг | По умолчанию | Смысл |
+|---|---|---|
+| `-queries` | | файл с запросами |
+| `-ids` | | файл с id, ссылками или CSV с `supplier_id` |
+| `-pages` | 10 | страниц каталога на запрос (по 100 товаров) |
+| `-limit` | 0 | остановить сбор на N уникальных продавцах, 0 = без лимита |
+| `-out` | по формату | `out/sellers.csv` или `out/sellers.ndjson`; `-` = stdout |
+| `-format` | csv | `csv` или `ndjson` |
+| `-ids-out` | `out/supplier_ids.txt` | куда записать найденные id, пусто = не писать |
+| `-search-only` | false | только сбор, без юрданных |
+| `-wb-search` | | путь к бинарнику `wb-search` |
+| `-rps` | 5 | запросов в секунду к CDN |
+| `-cache` | `out/cache.json` | файл кэша |
+| `-enrich`, `-enrich-ip` | false | обогащение OFData, включая ИП |
+| `-ofdata-key` | `$OFDATA_KEY` | ключ OFData |
+| `-ofdata-rps` | 3 | запросов в секунду к OFData |
+
+## cmd/wb-search отдельно
+
+Обычно его не запускают руками, но можно:
 
 ```bash
-# CLI: список id или ссылок на продавца, по одному на строку
-go run ./cmd/wb-sellers -ids ids.txt -out out/sellers.csv
-
-# Поиск по запросам (категориям) с остановкой на 100 уникальных продавцах.
-# Откроется окно браузера: поиск идёт через wb-search, который запускается сам.
-go run ./cmd/wb-sellers -queries queries.txt -limit 100
-
-# То же через поисковый API с профилем site-mimic (сейчас WB отвечает ему 403)
-go run ./cmd/wb-sellers -queries queries.txt -engine mimic -profile windows-chrome152.json -limit 100
-
-# Веб-интерфейс на http://localhost:8080
-go run ./cmd/wb-server
-
-# Docker
-docker build -t wb-server .
-docker run --rm -p 8080:8080 -v "$PWD/out:/data" wb-server
+go run ./cmd/wb-search -q "кроссовки мужские" -pages 3 -out out/search.csv
+go run ./cmd/wb-sellers -ids out/search.csv -limit 50
 ```
 
-Файл `ids.txt` принимает голые числа и ссылки вида `https://www.wildberries.ru/seller/12345`,
-а также CSV с колонкой `supplier_id`: вывод `wb-search` подаётся в `-ids` как есть.
-В репозитории лежит пример с четырьмя продавцами: без российского ИНН, юрлицо, ИП и
-отсутствующий на CDN, чтобы одним запуском проверить все ветки, включая `-enrich`.
-Файл `queries.txt` — поисковые запросы, по одному на строку.
-Строки, начинающиеся с `#`, пропускаются. Флаг `-limit N` останавливает сбор на N уникальных продавцах.
+Первая команда собирает товары (название, бренд, цена, продавец) в CSV, вторая берёт
+из него `supplier_id`. Использование подчиняется правилам Wildberries.
 
-Полный список флагов: `go run ./cmd/wb-sellers -h` и `go run ./cmd/wb-server -h`.
+## Структура проекта
 
-Флаг `-engine` выбирает, как искать по запросам: `browser` (по умолчанию) запускает
-`wb-search` подпроцессом, `mimic` ходит в поисковый API через site-mimic. Бинарник
-`wb-search` ищется рядом с `wb-sellers`/`wb-server`, в PATH, а при запуске через `go run`
-из каталога модуля собирается на лету. Собранным бинарникам положите рядом `wb-search`
-(`go build ./cmd/wb-search`) или укажите путь флагом `-wb-search`.
-
-### Доступ к серверу
-
-По умолчанию сервер слушает `127.0.0.1:8080`, то есть доступен только с этой машины.
-Он принимает запросы с Host `localhost`, loopback-адресов и имён, заданных через `-allowed-hosts`.
-Это защищает от CSRF и DNS-rebinding. Чтобы открыть сервер по сети или по домену:
-
-```bash
-go run ./cmd/wb-server -addr :8080 -allowed-hosts sellers.local,10.0.0.5:8080
+```
+cmd/wb-sellers/      CLI: флаги, сигналы, вызов конвейера
+cmd/wb-search/       поиск товаров по запросу через браузер (go-rod)
+internal/wbsearch/   wb.Source поверх cmd/wb-search: подпроцесс на запрос, разбор его CSV
+internal/wb/         предметная область: SellerHit, Source, Supplier, клиент CDN, разбор ввода
+internal/collect/    конвейер Runner: источник → пул воркеров → CSV/NDJSON
+internal/store/      Cache: память + JSON-файл, безопасен для горутин
+internal/ofdata/     обогащение из реестра OFData (ЕГРЮЛ/ЕГРИП)
+.github/workflows/   CI: сборка, vet, gofmt, тесты -race, golangci-lint, govulncheck
+.golangci.yml        набор линтеров и осознанные исключения
 ```
 
-Запуск в Docker через `-p 8080:8080` и обращение по `localhost:8080` работает без настройки.
+```mermaid
+flowchart TD
+    cli["cmd/wb-sellers"] --> collect["internal/collect<br/>Runner, CSV, NDJSON"]
+    cli --> wbsearch["internal/wbsearch<br/>cmd/wb-search подпроцессом"]
+    cli --> ofdata["internal/ofdata"]
+    collect --> store["internal/store<br/>Cache"]
+    collect --> wb["internal/wb<br/>типы, Source, клиент CDN"]
+    wbsearch --> wb
+    ofdata --> wb
+    store --> wb
+```
 
-Образ работает от пользователя `nonroot` (uid 65532), каталог `/data` в образе уже принадлежит ему,
-поэтому именованные и анонимные тома работают сразу. При bind-mount на Linux каталог на хосте
-должен быть доступен этому uid на запись: `chown 65532 out` или `docker run --user "$(id -u)" ...`.
+Зависимости направлены строго вниз, циклов нет. Внешние модули: `go-rod/rod` и
+`go-rod/stealth` для `wb-search`, `golang.org/x/time` для ограничения скорости.
 
 ## Разработка
 
@@ -311,109 +293,18 @@ golangci-lint run ./... # линтеры из .golangci.yml (нужен golangci
 govulncheck ./...       # известные уязвимости в toolchain и зависимостях
 ```
 
-То же самое запускает CI на каждый push и pull request (`.github/workflows/ci.yml`),
-плюс проверяет, что Docker-образ собирается. Версия Go зафиксирована строкой
-`toolchain` в `go.mod` и совпадает с базовым образом в Dockerfile.
+То же самое запускает CI на каждый push и pull request. Версия Go зафиксирована строкой
+`toolchain` в `go.mod`.
 
-Тесты не ходят в сеть: CDN, поисковый API и OFData подменяются `httptest.NewServer`,
-кэш живёт в `t.TempDir()`. `Searcher` в тестах работает с настоящим профилем site-mimic,
-но по обычному HTTP в сторону тестового сервера.
+Тесты не ходят в сеть и не открывают браузер: CDN и OFData подменяются
+`httptest.NewServer`, `wb-search` в тестах `internal/wbsearch` изображает shell-скрипт,
+кэш живёт в `t.TempDir()`.
 
 ## Свой источник продавцов
 
-Любой тип с методом `Collect(ctx context.Context, emit func(wb.SellerHit)) error` подходит как `wb.Source`.
-В CLI он добавляется в слайс `sources` в `cmd/wb-sellers/main.go`,
-в сервере — в замыкание `NewSearch` в `cmd/wb-server/main.go`.
-Контракт: вызывать `emit` синхронно и возвращать `ctx.Err()`, как только контекст отменён.
-Если источник отдаёт целую страницу за раз и проверяет `ctx` только между страницами,
-`Runner` сам отбросит всё лишнее после `-limit`.
-
-## Сбор id из каталога (cmd/wb-search)
-
-Команда, которая открывает каталог витрины в браузере (go-rod) и собирает товары
-по запросу в CSV с колонкой `supplier_id`. В обычном сценарии её не запускают руками:
-`wb-sellers -queries` и режим «Поисковые запросы» в `wb-server` запускают её сами
-(`internal/wbsearch`), по одному запуску на запрос, и читают её CSV. Можно использовать
-и отдельно, тогда CSV подаётся в `wb-sellers -ids` или в поле ввода веб-интерфейса
-как есть. Использование подчиняется правилам Wildberries.
-
-```bash
-go run ./cmd/wb-search -q "кроссовки мужские" -pages 3 -out out/search.csv
-go run ./cmd/wb-sellers -ids out/search.csv -limit 50 -out out/sellers.csv
-```
-
-В Docker-образе браузера нет, поэтому там режим поиска работает через site-mimic
-(`-engine mimic` в ENTRYPOINT), а режим списка id всегда.
-
-## Если поиск не отвечает
-
-Поисковый API может ответить 403, 429 или 498 (JS-проверка). Запрос с 429 повторяется с ротацией
-шарда, остальные пропускаются, и прогон идёт дальше с тем, что собрано. Это не ошибка, а
-предупреждение: в вебе оно показывается под прогрессом (`State.Warning`), в CLI печатается
-строкой `прогон завершён с предупреждением` в конце. «Готово, 0 продавцов» без предупреждения
-означает, что источник действительно ничего не вернул.
-
-## Остановка по количеству
-
-Флаг `-limit N` (в вебе — поле «хватит продавцов», для обоих режимов) останавливает сбор, как только
-набрано `N` уникальных продавцов, и дальше качает юрданные только по ним. Это и есть
-сценарий «дай N продавцов из категории»: источник листает витрину, `Runner` считает
-уникальные `supplierId`, на N-м отменяет контекст сбора, источник видит `ctx.Err()`
-и выходит. Контекст юрданных отдельный, поэтому второй этап не прерывается.
-Повторяющиеся `supplierId` (у продавца много товаров) схлопываются в map, лишних
-запросов к CDN нет.
-
-## Обогащение из реестра (OFData)
-
-Юрданные с CDN WB дают ИНН. Флаг `-enrich` по этому ИНН дотягивает из ЕГРЮЛ/ЕГРИП
-через [OFData](https://ofdata.ru) статус, дату регистрации, полное наименование,
-адрес, основной ОКВЭД и руководителя. Эндпоинт выбирается по длине ИНН: 10 цифр —
-юрлицо, 12 — ИП.
-
-```bash
-export OFDATA_KEY=...            # ключ только из окружения, в коде его нет
-go run ./cmd/wb-sellers -ids ids.txt -enrich            # обогащать юрлица
-go run ./cmd/wb-sellers -ids ids.txt -enrich -enrich-ip # и ИП тоже
-```
-
-- `-enrich` включает обогащение, `-enrich-ip` добавляет к нему ИП (по умолчанию ИП пропускаются).
-- Ключ берётся из `OFDATA_KEY` или флага `-ofdata-key`. В репозиторий ключ не коммитится.
-- Обогащается только российский ИНН из 10 или 12 цифр. У продавцов из Беларуси и Казахстана
-  вместо ИНН УНП/БИН, в ЕГРЮЛ их нет, поэтому запрос к OFData за них не уходит.
-- Обогащение кэшируется вместе с юрданными (`Supplier.Enrich`), повторный запуск не платит за него снова.
-  Ответ «в реестре нет» тоже кэшируется (`Enrichment.NotFound`): это такой же платный ответ.
-- Ошибка API (баланс исчерпан, неверный запрос) в кэш не пишется и считается в `enrichFailed`
-  итогового лога; следующий прогон попробует снова. Юрданные при этом сохраняются.
-- Отклонённый ключ (401/403) останавливает весь прогон с ошибкой (код выхода 1), а не
-  повторяет обречённый запрос для каждого продавца. Юрданные, полученные к этому моменту,
-  уже в кэше: после исправления ключа повторный запуск обогатит их без походов на CDN.
-- В CSV добавляются колонки `of_*`; в NDJSON — вложенный объект `enrich`.
-- У продавцов-физлиц CDN отдаёт `sellerType: C2C` без ИНН; это поле есть в CSV и NDJSON,
-  обогащать таких некого.
-
-## Кэш и повторные запуски
-
-Кэш `cache.json` хранит юрданные и обогащение, повторный запуск не ходит в сеть за тем, что
-уже есть. Ответ CDN «нет такого продавца» тоже кэшируется с датой и перепроверяется через
-7 дней (`Runner.NotFoundTTL`): продавец мог появиться позже. Пометки `notFound` без даты
-остались от версии с неверным путём CDN и при загрузке удаляются, об этом пишется в лог.
-
-## Форматы вывода: файл или поток
-
-`-format csv` (по умолчанию) собирает всё и пишет отсортированный CSV в `-out` файл.
-`-format ndjson` отдаёт по одному JSON-объекту на строку **по мере готовности** продавца.
-Если `-out` не задан, файл называется `out/sellers.csv` или `out/sellers.ndjson` по формату.
-CSV пишется во временный файл и переименовывается, поэтому по пути `-out` не бывает недописанного файла.
-
-Для обработки другим приложением в реальном времени — NDJSON в stdout:
-
-```bash
-go run ./cmd/wb-sellers -ids ids.txt -enrich -format ndjson -out - | ваше-приложение
-```
-
-Логи идут в stderr, данные в stdout, поэтому поток не загрязняется. Каждая запись
-появляется сразу, как только продавец получен и обогащён, ждать конца не нужно.
-Если поток вывода сломался (читающий процесс завершился, диск кончился), прогон
-останавливается с ошибкой, а не продолжает молча ходить в сеть: всё полученное к этому
-моменту уже лежит в кэше. Это касается и `| head`: SIGPIPE в `wb-sellers` игнорируется,
-поэтому закрытый пайп превращается в обычную ошибку записи, а не убивает процесс.
+Любой тип с методом `Collect(ctx context.Context, emit func(wb.SellerHit)) error`
+подходит как `wb.Source`; он добавляется в слайс `sources` в `cmd/wb-sellers/main.go`.
+Контракт: вызывать `emit` синхронно и возвращать `ctx.Err()`, как только контекст
+отменён. Если источник отдаёт целую страницу за раз, лишнее после `-limit` `Runner`
+отбросит сам. Для поиска по запросам достаточно реализовать `wb.QuerySearcher`
+и подставить его в `wb.QuerySearch`.

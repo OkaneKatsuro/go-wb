@@ -164,7 +164,7 @@ func (c *SupplierClient) fetch(ctx context.Context, id int) (*Supplier, bool, er
 	if err != nil {
 		return nil, true, err
 	}
-	body, err := readBody(resp, maxSupplierBody)
+	body, err := ReadLimited(resp.Body, maxSupplierBody)
 	_ = resp.Body.Close() // ошибка закрытия тела ответа ничего не добавляет к ошибке чтения
 	if err != nil {
 		return nil, true, fmt.Errorf("чтение ответа: %w", err)

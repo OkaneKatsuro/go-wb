@@ -42,7 +42,7 @@ type Result struct {
 	// EnrichFailed — продавцы, у которых юрданные есть, а обогащение упало.
 	// В кэш такое не пишется, следующий прогон попробует снова.
 	EnrichFailed int
-	Warning      string // нефатальная проблема, напр. поиск остановлен ErrChallenge
+	Warning      string // нефатальная проблема, напр. часть запросов пропущена
 }
 
 // Enricher обогащает продавца по ИНН данными из внешнего реестра.
@@ -160,9 +160,6 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	case err == nil:
 	case reachedLimit && ctx.Err() == nil:
 		// Сбор прервали мы сами, набрав лимит. Это штатное завершение, не ошибка.
-	case errors.Is(err, wb.ErrChallenge):
-		res.Warning = err.Error()
-		slog.Warn("поиск остановлен, продолжаю с тем, что собрано", "sellers", len(res.IDs))
 	case errors.Is(err, wb.ErrQueriesSkipped):
 		// Часть запросов не выполнилась: это видно в Warning, а не спрятано в логе.
 		res.Warning = err.Error()

@@ -10,5 +10,4 @@ cmd/wb-test/
 
 # собранные бинарники
 /wb-sellers
-/wb-server
 /wb-search

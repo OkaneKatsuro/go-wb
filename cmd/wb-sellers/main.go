@@ -1,7 +1,9 @@
 // wb-sellers собирает юридические данные продавцов Wildberries из командной строки.
 //
-// Шаг 1: найти supplierId через Source (файл с id, поиск WB по запросам).
-// Шаг 2: получить юрданные по каждому supplierId из публичного CDN.
+// Шаг 1: найти supplierId через Source: файл с id или поиск по запросам
+// (cmd/wb-search запускается подпроцессом, в нём открывается браузер).
+// Шаг 2: получить юрданные по каждому supplierId из публичного CDN,
+// при -enrich дотянуть реестр через OFData.
 // Результат: CSV целиком в конце или NDJSON построчно по мере готовности.
 package main
 
@@ -34,10 +36,10 @@ const (
 // config хранит все флаги. flag.StringVar пишет прямо в поле,
 // поэтому дальше программа работает с обычными значениями, а не с указателями.
 type config struct {
-	queries, ids, out, idsOut, profile, proxy, dest, version, cache, dump string
-	format, ofdataKey, engine, wbSearch                                   string
-	pages, rps, limit, ofdataRps                                          int
-	searchOnly, enrich, enrichIP                                          bool
+	queries, ids, out, idsOut, cache, wbSearch string
+	format, ofdataKey                          string
+	pages, rps, limit, ofdataRps               int
+	searchOnly, enrich, enrichIP               bool
 }
 
 func main() {
@@ -54,16 +56,10 @@ func realMain() int {
 	flag.StringVar(&c.out, "out", "", "итоговый файл: out/sellers.csv или out/sellers.ndjson по формату; «-» = stdout")
 	flag.StringVar(&c.idsOut, "ids-out", "out/supplier_ids.txt", "куда записать найденные supplierId (пусто = не писать)")
 	flag.BoolVar(&c.searchOnly, "search-only", false, "только поиск, без юрданных")
-	flag.StringVar(&c.engine, "engine", "browser", "как искать по запросам: browser (через wb-search, окно браузера) или mimic (site-mimic по профилю)")
 	flag.StringVar(&c.wbSearch, "wb-search", "", "путь к бинарнику wb-search (пусто = рядом с wb-sellers, в PATH или go run из каталога модуля)")
-	flag.StringVar(&c.profile, "profile", "windows-chrome152.json", "профиль site-mimic для -engine mimic")
-	flag.StringVar(&c.proxy, "proxy", "", "прокси для поиска, http://user:pass@host:port")
-	flag.StringVar(&c.dest, "dest", "-1257786", "регион WB (dest)")
-	flag.StringVar(&c.version, "api-version", "v18", "версия поискового API")
 	flag.IntVar(&c.rps, "rps", 5, "запросов в секунду к CDN юрданных")
 	flag.IntVar(&c.limit, "limit", 0, "остановить сбор, набрав столько уникальных продавцов (0 = без лимита)")
 	flag.StringVar(&c.cache, "cache", "out/cache.json", "кэш юрданных")
-	flag.StringVar(&c.dump, "dump", "out/first_response.json", "сохранить первый сырой ответ поиска (пусто = не сохранять)")
 	flag.StringVar(&c.format, "format", "csv", "формат вывода: csv или ndjson")
 	flag.BoolVar(&c.enrich, "enrich", false, "обогащать юрданные из реестра OFData")
 	flag.BoolVar(&c.enrichIP, "enrich-ip", false, "обогащать и ИП (12-значный ИНН), иначе только юрлица")
@@ -111,11 +107,6 @@ func (c *config) validate() error {
 	if c.out == "" {
 		c.out = "out/sellers." + c.format
 	}
-	switch c.engine {
-	case "browser", "mimic":
-	default:
-		return fmt.Errorf("неизвестный -engine %q (browser или mimic)", c.engine)
-	}
 	if c.enrich && c.ofdataKey == "" {
 		c.ofdataKey = os.Getenv("OFDATA_KEY")
 	}
@@ -126,7 +117,7 @@ func (c *config) validate() error {
 }
 
 func run(ctx context.Context, c config) error {
-	for _, p := range []string{c.out, c.cache, c.idsOut, c.dump} {
+	for _, p := range []string{c.out, c.cache, c.idsOut} {
 		if p != "" && p != "-" {
 			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 				return err
@@ -155,11 +146,7 @@ func run(ctx context.Context, c config) error {
 		if len(queries) == 0 {
 			return fmt.Errorf("в %s нет ни одного запроса", c.queries)
 		}
-		src, err := newQuerySource(c, queries)
-		if err != nil {
-			return err
-		}
-		sources = append(sources, src)
+		sources = append(sources, wbsearch.Source{Runner: wbsearch.Runner{Bin: c.wbSearch}, Queries: queries, Pages: c.pages})
 	}
 
 	cache, err := store.Load(c.cache)
@@ -232,21 +219,6 @@ func run(ctx context.Context, c config) error {
 	}
 	slog.Info("готово", "rows", n, "file", c.out, "failed", res.Failed, "enrichFailed", res.EnrichFailed)
 	return nil
-}
-
-// newQuerySource строит источник для поиска по запросам согласно -engine.
-// browser: cmd/wb-search подпроцессом (открывает окно браузера), один запуск на
-// запрос; mimic: поисковый API через site-mimic с профилем браузера.
-func newQuerySource(c config, queries []string) (wb.Source, error) {
-	if c.engine == "mimic" {
-		s, err := wb.NewSearcher(c.profile, c.proxy, c.dest, c.version)
-		if err != nil {
-			return nil, fmt.Errorf("site-mimic: %w", err)
-		}
-		s.DumpPath = c.dump
-		return wb.QuerySearch{Searcher: s, Queries: queries, Pages: c.pages}, nil
-	}
-	return wbsearch.Source{Runner: wbsearch.Runner{Bin: c.wbSearch}, Queries: queries, Pages: c.pages}, nil
 }
 
 // openOut возвращает writer для вывода: stdout при "-", иначе файл.
