@@ -5,7 +5,7 @@
 ЕГРЮЛ/ЕГРИП через OFData. Одна команда от запроса до таблицы:
 
 ```bash
-go run ./cmd/wb-sellers -queries queries.txt -limit 50 -out out/sellers.csv
+go run ./cmd/wb-sellers -q "кроссовки мужские" -limit 50 -out out/sellers.csv
 ```
 
 На экране откроется окно браузера: по каждому запросу конвейер сам запускает
@@ -21,15 +21,15 @@ go run ./cmd/wb-sellers -queries queries.txt -limit 50 -out out/sellers.csv
 ```bash
 git clone https://github.com/OkaneKatsuro/go-wb.git && cd go-wb
 
-# 1. Запросы, по одному на строку (пример уже лежит в репозитории)
-cat queries.txt
+# 1. Запуск: 50 уникальных продавцов по запросу
+go run ./cmd/wb-sellers -q "кроссовки мужские" -limit 50 -out out/sellers.csv
 
-# 2. Запуск: 50 уникальных продавцов по этим запросам
-go run ./cmd/wb-sellers -queries queries.txt -limit 50 -out out/sellers.csv
-
-# 3. Результат
+# 2. Результат
 open out/sellers.csv
 ```
+
+Несколько запросов: повторите `-q` или положите их в файл по одному на строку и
+передайте `-queries queries.txt` (пример в репозитории).
 
 Что происходит во время запуска, видно в логе (stderr): запуск `wb-search`, получение
 сессии, страницы каталога, затем счётчик юрданных и итог `готово rows=N`.
@@ -40,15 +40,15 @@ open out/sellers.csv
 # По готовому списку id или ссылок на продавца (пример ids.txt в репозитории)
 go run ./cmd/wb-sellers -ids ids.txt -out out/sellers.csv
 
-# Больше страниц каталога на запрос (по 100 товаров на странице, продавцы повторяются)
-go run ./cmd/wb-sellers -queries queries.txt -pages 5 -limit 200
+# Несколько запросов и больше страниц каталога (по 100 товаров на странице, продавцы повторяются)
+go run ./cmd/wb-sellers -q "куртка зимняя" -q "пуховик мужской" -pages 5 -limit 200
 
 # С обогащением из реестра ЕГРЮЛ/ЕГРИП: телефоны, почта, статус, ОКВЭД (нужен ключ OFData)
 echo 'OFDATA_KEY=ваш_ключ' > .env      # один раз; файл в .gitignore
-go run ./cmd/wb-sellers -queries queries.txt -limit 50 -enrich -enrich-ip
+go run ./cmd/wb-sellers -q "кроссовки мужские" -limit 50 -enrich -enrich-ip
 
 # Поток NDJSON в другую программу по мере готовности каждого продавца
-go run ./cmd/wb-sellers -queries queries.txt -format ndjson -out - | ваше-приложение
+go run ./cmd/wb-sellers -q "кроссовки мужские" -format ndjson -out - | ваше-приложение
 ```
 
 Полный список флагов: `go run ./cmd/wb-sellers -h`.
@@ -57,7 +57,7 @@ go run ./cmd/wb-sellers -queries queries.txt -format ndjson -out - | ваше-п
 
 ```mermaid
 flowchart TD
-    Q["queries.txt<br/>запросы по одному на строку"] --> CLI["cmd/wb-sellers"]
+    Q["-q «запрос» (повторяемый)<br/>или queries.txt"] --> CLI["cmd/wb-sellers"]
     I["ids.txt<br/>id, ссылки или CSV с supplier_id"] --> CLI
     CLI --> RUN["collect.Runner.Run(ctx)"]
 
@@ -170,12 +170,14 @@ flowchart TD
 
 ## Входные данные
 
-- `queries.txt` — поисковые запросы, по одному на строку. Строки с `#` пропускаются.
+- `-q "запрос"` — поисковый запрос прямо в команде, флаг можно повторять.
+- `queries.txt` — то же списком, по одному на строку; строки с `#` пропускаются.
+  `-q` и `-queries` можно сочетать.
 - `ids.txt` — `supplierId` по одному на строку, ссылки вида
   `https://www.wildberries.ru/seller/12345`, либо CSV с колонкой `supplier_id`
   (например, вывод `wb-search`, запущенного вручную). Пример в репозитории покрывает
   все случаи: продавец без российского ИНН, юрлицо, ИП и отсутствующий на CDN.
-- `-queries` и `-ids` можно задать вместе: список id идёт первым, затем поиск.
+- Запросы и `-ids` можно задать вместе: список id идёт первым, затем поиск.
 
 ## Выход
 
@@ -230,7 +232,8 @@ of_address, of_okvedCode, of_okvedName, of_director, of_phones, of_emails, of_we
 
 | Флаг | По умолчанию | Смысл |
 |---|---|---|
-| `-queries` | | файл с запросами |
+| `-q` | | поисковый запрос, повторяемый |
+| `-queries` | | файл с запросами, по одному на строку |
 | `-ids` | | файл с id, ссылками или CSV с `supplier_id` |
 | `-pages` | 10 | страниц каталога на запрос (по 100 товаров) |
 | `-limit` | 0 | остановить сбор на N уникальных продавцах, 0 = без лимита |

@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/OkaneKatsuro/go-wb/internal/collect"
@@ -38,9 +39,16 @@ const (
 type config struct {
 	queries, ids, out, idsOut, cache, wbSearch string
 	format, ofdataKey                          string
+	q                                          multiFlag // запросы прямо из командной строки
 	pages, rps, limit, ofdataRps               int
 	searchOnly, enrich, enrichIP               bool
 }
+
+// multiFlag копит значения повторяемого флага: -q "куртка" -q "шапка".
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ", ") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
 func main() {
 	os.Exit(realMain())
@@ -56,7 +64,8 @@ func realMain() int {
 		return exitErr
 	}
 	var c config
-	flag.StringVar(&c.queries, "queries", "", "файл с поисковыми запросами, один на строку")
+	flag.Var(&c.q, "q", "поисковый запрос; можно повторять: -q \"куртка\" -q \"шапка\"")
+	flag.StringVar(&c.queries, "queries", "", "файл с поисковыми запросами, один на строку (вместо или вдобавок к -q)")
 	flag.StringVar(&c.ids, "ids", "", "файл с supplierId: по одному id или ссылке на строку, либо CSV с колонкой supplier_id (вывод wb-search)")
 	flag.IntVar(&c.pages, "pages", 10, "максимум страниц на запрос (по 100 товаров)")
 	flag.StringVar(&c.out, "out", "", "итоговый файл: out/sellers.csv или out/sellers.ndjson по формату; «-» = stdout")
@@ -102,8 +111,8 @@ func realMain() int {
 // validate проверяет флаги до любой работы, чтобы ошибка в них не всплыла
 // после минуты поиска. Здесь же подставляется имя выходного файла по формату.
 func (c *config) validate() error {
-	if c.queries == "" && c.ids == "" {
-		return errors.New("нужен -queries или -ids")
+	if len(c.q) == 0 && c.queries == "" && c.ids == "" {
+		return errors.New("нужен запрос (-q), файл запросов (-queries) или список id (-ids)")
 	}
 	switch c.format {
 	case "csv", "ndjson":
@@ -144,14 +153,18 @@ func run(ctx context.Context, c config) error {
 		}
 		sources = append(sources, wb.HitList(hits))
 	}
+	queries := append([]string(nil), c.q...)
 	if c.queries != "" {
-		queries, err := wb.ReadLines(c.queries)
+		fromFile, err := wb.ReadLines(c.queries)
 		if err != nil {
 			return err
 		}
-		if len(queries) == 0 {
+		if len(fromFile) == 0 {
 			return fmt.Errorf("в %s нет ни одного запроса", c.queries)
 		}
+		queries = append(queries, fromFile...)
+	}
+	if len(queries) > 0 {
 		sources = append(sources, wbsearch.Source{Runner: wbsearch.Runner{Bin: c.wbSearch}, Queries: queries, Pages: c.pages})
 	}
 
