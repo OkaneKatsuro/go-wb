@@ -105,8 +105,8 @@ func TestImportCreatesDealWithContactAndNote(t *testing.T) {
 	}
 
 	opp := calls[5].body
-	if opp["amoId"] != "wb:7203195439" || opp["stage"] != "NERAZOBRANNOE" {
-		t.Errorf("сделка: amoId/stage неверные: %+v", opp)
+	if opp["amoId"] != "wb:7203195439" || opp["stage"] != "NERAZOBRANNOE" || opp["source"] != "WB" {
+		t.Errorf("сделка: amoId/stage/source неверные: %+v", opp)
 	}
 	if opp["pointOfContactId"] != "pe-1" || opp["companyId"] != "co-1" {
 		t.Errorf("сделка не связана с контактом/компанией: %+v", opp)

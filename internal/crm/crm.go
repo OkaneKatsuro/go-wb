@@ -122,6 +122,7 @@ func (c *Client) Import(ctx context.Context, lead Lead) (Result, error) {
 	opp := map[string]any{
 		"name":      trunc("WB: "+firstNonEmpty(lead.Trademark, lead.Name, inn), 250),
 		"stage":     stage,
+		"source":    "WB", // воронка WB (поле «Источник»)
 		"amoId":     amoID(inn),
 		"companyId": companyID,
 		"createdBy": actor,
