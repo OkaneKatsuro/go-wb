@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,6 +26,28 @@ var actor = map[string]string{"source": "API", "name": "WB-лидген"}
 
 // stage — стартовая стадия: «разобрать». Менеджер разбирает из неё.
 const stage = "NERAZOBRANNOE"
+
+// Значения, уходящие в фильтр Twenty, валидируются строго: иначе кавычка или
+// `%` в грамматике фильтра могли бы сломать запрос или склеить лид с чужой
+// записью. ИНН — только цифры, хост — только буквы/цифры/дефис/точка.
+var (
+	reINN  = regexp.MustCompile(`^\d{10}$|^\d{12}$`)
+	reHost = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+)
+
+// validEmail — адрес, который не сломает фильтр: разбирается net/mail и не
+// содержит кавычек и запятых (на всякий случай, их в адресе быть не должно).
+func validEmail(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.ContainsAny(s, `",`) {
+		return ""
+	}
+	addr, err := mail.ParseAddress(s)
+	if err != nil || addr.Address != s {
+		return ""
+	}
+	return s
+}
 
 // Lead — один продавец на вход коннектора, собранный из NDJSON go-wb.
 type Lead struct {
@@ -75,8 +99,9 @@ type Result struct {
 // amoId: повторный прогон вернёт Created=false и уже существующую сделку.
 func (c *Client) Import(ctx context.Context, lead Lead) (Result, error) {
 	inn := strings.TrimSpace(lead.INN)
-	if inn == "" {
-		return Result{}, fmt.Errorf("пустой ИНН: нечем дедупить")
+	if !reINN.MatchString(inn) {
+		// Только цифры 10/12 знаков: иначе нечем дедупить и опасно для фильтра.
+		return Result{}, fmt.Errorf("ИНН не похож на ИНН: %q", inn)
 	}
 
 	if id, err := c.findOpportunity(ctx, amoID(inn)); err != nil {
@@ -117,6 +142,9 @@ func (c *Client) Import(ctx context.Context, lead Lead) (Result, error) {
 
 func (c *Client) ensureCompany(ctx context.Context, lead Lead) (string, error) {
 	domain := domainOf(lead.Website)
+	if domain != "" && !reHost.MatchString(domain) {
+		domain = "" // не похоже на хост: не ищем и не записываем ссылку
+	}
 	if domain != "" {
 		if id, err := c.findCompany(ctx, domain); err != nil {
 			return "", err
@@ -139,7 +167,13 @@ func (c *Client) ensureCompany(ctx context.Context, lead Lead) (string, error) {
 }
 
 func (c *Client) ensurePerson(ctx context.Context, lead Lead, companyID string) (string, error) {
-	email := firstNonEmpty(lead.Emails...)
+	email := ""
+	for _, e := range lead.Emails {
+		if v := validEmail(e); v != "" {
+			email = v
+			break
+		}
+	}
 	if email != "" {
 		if id, err := c.findPerson(ctx, email); err != nil {
 			return "", err
@@ -213,8 +247,30 @@ func (c *Client) findOpportunity(ctx context.Context, amo string) (string, error
 }
 
 func (c *Client) findCompany(ctx context.Context, domain string) (string, error) {
-	// Ссылки хранятся по-разному; совпадение нестрогое, этого для дедупа хватает.
-	return c.findFirst(ctx, "companies", fmt.Sprintf("domainName.primaryLinkUrl[like]:%q", "%"+domain+"%"))
+	// Ссылки хранятся по-разному ("https://x.ru", "x.ru/"), поэтому ищем нестрого,
+	// а затем берём только точное совпадение голого домена: like `%домен%` иначе
+	// вернул бы и чужую компанию, где домен лишь подстрока.
+	filter := fmt.Sprintf("domainName.primaryLinkUrl[like]:%q", "%"+domain+"%")
+	path := fmt.Sprintf("/rest/companies?filter=%s&limit=20&depth=0", url.QueryEscape(filter))
+	var raw json.RawMessage
+	if err := c.do(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return "", err
+	}
+	for _, row := range firstList(raw) {
+		var r struct {
+			ID         string `json:"id"`
+			DomainName struct {
+				PrimaryLinkURL string `json:"primaryLinkUrl"`
+			} `json:"domainName"`
+		}
+		if json.Unmarshal(row, &r) != nil {
+			continue
+		}
+		if domainOf(r.DomainName.PrimaryLinkURL) == domain {
+			return r.ID, nil
+		}
+	}
+	return "", nil
 }
 
 func (c *Client) findPerson(ctx context.Context, email string) (string, error) {

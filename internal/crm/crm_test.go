@@ -148,9 +148,43 @@ func TestImportDeduplicatesByAmoId(t *testing.T) {
 	}
 }
 
-func TestImportNeedsINN(t *testing.T) {
-	_, err := New("http://x", "k", 1000).Import(context.Background(), Lead{Name: "no inn"})
-	if err == nil {
-		t.Fatal("ожидал ошибку на пустой ИНН")
+func TestImportNeedsValidINN(t *testing.T) {
+	for _, inn := range []string{"", "no inn", `7"or 1=1`, "12345"} {
+		if _, err := New("http://x", "k", 1000).Import(context.Background(), Lead{INN: inn, Name: "x"}); err == nil {
+			t.Errorf("ожидал ошибку на ИНН %q", inn)
+		}
+	}
+}
+
+// Нестрогий like может вернуть компанию, где домен лишь подстрока. Коннектор
+// обязан её отвергнуть и создать новую, иначе лид склеится с чужой записью.
+func TestImportVerifiesCompanyDomain(t *testing.T) {
+	var postedCompany bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/opportunities"):
+			io.WriteString(w, `{"data":{"opportunities":[]}}`)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/companies"):
+			// Подстрочное совпадение на чужой домен.
+			io.WriteString(w, `{"data":{"companies":[{"id":"co-wrong","domainName":{"primaryLinkUrl":"https://notrgk72.ru.evil.com"}}]}}`)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/people"):
+			io.WriteString(w, `{"data":{"people":[]}}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/companies"):
+			postedCompany = true
+			io.WriteString(w, `{"data":{"createCompany":{"id":"co-new"}}}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/opportunities"):
+			io.WriteString(w, `{"data":{"createOpportunity":{"id":"op-1"}}}`)
+		default:
+			io.WriteString(w, `{"data":{"x":{"id":"z"}}}`)
+		}
+	}))
+	defer srv.Close()
+
+	if _, err := New(srv.URL, "k", 1000).Import(context.Background(), sampleLead()); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if !postedCompany {
+		t.Fatal("коннектор переиспользовал компанию с чужим доменом вместо создания новой")
 	}
 }
