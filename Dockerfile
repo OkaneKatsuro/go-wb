@@ -32,11 +32,12 @@ RUN apt-get update \
  && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 COPY --from=build /out/wb-sellers /out/wb-crm /out/wb-search /usr/local/bin/
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-# rod=bin=... прибивает путь к Chromium: иначе go-rod при промахе поиска
-# скачивает свой браузер в контейнер. TZ и DISPLAY можно переопределить в compose.
+# WB_BROWSER_BIN указывает wb-search на системный Chromium: без него go-rod
+# скачивает свой браузер при каждом запуске контейнера. TZ и DISPLAY можно
+# переопределить в compose.
 ENV DISPLAY=:99 \
     TZ=Europe/Moscow \
-    rod="bin=/usr/bin/chromium"
+    WB_BROWSER_BIN=/usr/bin/chromium
 USER app
 WORKDIR /data
 ENTRYPOINT ["dumb-init", "--", "entrypoint.sh"]

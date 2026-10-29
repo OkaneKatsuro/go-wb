@@ -149,8 +149,15 @@ func (p product) toItem(query string, page, pos int) Item {
 
 // ---------- Браузер и токен ----------
 
+// openBrowser запускает браузер с обычным окном. Путь к бинарнику можно задать
+// переменной WB_BROWSER_BIN (в Docker это системный Chromium), иначе go-rod
+// скачает свой в ~/.cache/rod при первом запуске.
 func openBrowser() (*rod.Browser, *rod.Page) {
-	u := launcher.New().Headless(false).MustLaunch()
+	l := launcher.New().Headless(false)
+	if bin := os.Getenv("WB_BROWSER_BIN"); bin != "" {
+		l = l.Bin(bin)
+	}
+	u := l.MustLaunch()
 	browser := rod.New().ControlURL(u).MustConnect()
 	page := stealth.MustPage(browser)
 	return browser, page
