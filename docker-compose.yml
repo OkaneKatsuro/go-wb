@@ -1,16 +1,17 @@
-# go-wb на сервере. Два сервиса-команды (profiles: cli), оба одноразовые через
-# `docker compose run`, постоянного процесса нет. Данные и кэш — в ./data.
+# go-wb на сервере. Оба сервиса одноразовые (profiles: cli), запускаются через
+# `docker compose run`, постоянного процесса нет. Данные, кэш и выгрузки — в ./data.
 #
-# search — полный конвейер с браузером (образ browser из Dockerfile):
+# Шаг 1, search — поиск в браузере (образ browser: Chromium + Xvfb). Ключей у этого
+# контейнера нет намеренно: браузер рисует чужой сайт, ему нечего знать про CRM.
 #   docker compose run --rm search \
-#     sh -c 'wb-sellers -q "кроссовки мужские" -limit 100 -enrich -enrich-ip \
-#              -cache /data/cache.json -ids-out /data/ids.txt -format ndjson -out - | wb-crm'
-#   только поиск, в CSV:
+#     wb-sellers -q "кроссовки мужские" -q "кроссовки женские" -limit 300 -search-only -ids-out /data/ids.txt
+#   один запрос с товарами в CSV:
 #   docker compose run --rm search wb-search -q "кроссовки мужские" -pages 3 -out /data/wb.csv
 #
-# import — без браузера, по готовому списку supplierId в ./data/ids.txt:
+# Шаг 2, import — юрданные, OFData и заливка в CRM по найденным id (ключи только здесь):
 #   docker compose run --rm import \
-#     sh -c 'wb-sellers -ids /data/ids.txt -enrich -enrich-ip -format ndjson -out - | wb-crm'
+#     sh -c 'wb-sellers -ids /data/ids.txt -enrich -enrich-ip -cache /data/cache.json \
+#              -format ndjson -out - | wb-crm'
 #   только заливка готовой выгрузки:
 #   docker compose run --rm import wb-crm -in /data/sellers.ndjson
 services:
@@ -19,7 +20,6 @@ services:
     build:
       context: .
       target: browser
-    env_file: .env          # OFDATA_KEY, TWENTY_API_URL, TWENTY_API_KEY
     volumes:
       - ./data:/data
     profiles: ["cli"]
@@ -29,7 +29,7 @@ services:
     build:
       context: .
       target: slim
-    env_file: .env
+    env_file: .env          # OFDATA_KEY, TWENTY_API_URL, TWENTY_API_KEY
     volumes:
       - ./data:/data
     profiles: ["cli"]
