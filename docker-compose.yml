@@ -1,18 +1,35 @@
-# Серверная часть go-wb: по списку supplierId (его готовит wb-search у тебя
-# локально) обогащает через OFData и льёт продавцов в CRM. Браузера тут нет.
+# go-wb на сервере. Два сервиса-команды (profiles: cli), оба одноразовые через
+# `docker compose run`, постоянного процесса нет. Данные и кэш — в ./data.
 #
-# Разовый прогон:
+# search — полный конвейер с браузером (образ browser из Dockerfile):
+#   docker compose run --rm search \
+#     sh -c 'wb-sellers -q "кроссовки мужские" -limit 100 -enrich -enrich-ip \
+#              -cache /data/cache.json -ids-out /data/ids.txt -format ndjson -out - | wb-crm'
+#   только поиск, в CSV:
+#   docker compose run --rm search wb-search -q "кроссовки мужские" -pages 3 -out /data/wb.csv
+#
+# import — без браузера, по готовому списку supplierId в ./data/ids.txt:
 #   docker compose run --rm import \
 #     sh -c 'wb-sellers -ids /data/ids.txt -enrich -enrich-ip -format ndjson -out - | wb-crm'
-#
-# Или по шагам, с сохранением выгрузки:
-#   docker compose run --rm import wb-sellers -ids /data/ids.txt -enrich -format ndjson -out /data/sellers.ndjson
+#   только заливка готовой выгрузки:
 #   docker compose run --rm import wb-crm -in /data/sellers.ndjson
 services:
-  import:
-    image: go-wb:latest
-    build: .
+  search:
+    image: go-wb-browser:latest
+    build:
+      context: .
+      target: browser
     env_file: .env          # OFDATA_KEY, TWENTY_API_URL, TWENTY_API_KEY
     volumes:
-      - ./data:/data        # сюда кладёшь ids.txt; тут же кэш и выгрузки
-    profiles: ["cli"]       # один раз: docker compose run, не постоянный сервис
+      - ./data:/data
+    profiles: ["cli"]
+
+  import:
+    image: go-wb:latest
+    build:
+      context: .
+      target: slim
+    env_file: .env
+    volumes:
+      - ./data:/data
+    profiles: ["cli"]

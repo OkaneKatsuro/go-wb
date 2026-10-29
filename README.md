@@ -260,18 +260,48 @@ go run ./cmd/wb-sellers -ids out/search.csv -limit 50
 Первая команда собирает товары (название, бренд, цена, продавец) в CSV, вторая берёт
 из него `supplier_id`. Использование подчиняется правилам Wildberries.
 
+## На сервере (Docker)
+
+Сервер без монитора — не помеха: образ `browser` из `Dockerfile` содержит Chromium,
+виртуальный экран Xvfb и все три команды, а `wb-search` открывает в нём обычное окно
+браузера, как на ноутбуке. Код поиска от этого не меняется: `DISPLAY` приходит из
+окружения, `--no-sandbox` go-rod добавляет сам, когда видит контейнер. Второй образ,
+`slim`, без браузера, годится для пути `-ids` и заливки в CRM.
+
+```bash
+# Сборка под x86_64-сервер с Mac на Apple Silicon (Go кросс-компилируется)
+docker buildx build --platform linux/amd64 --target browser -t go-wb-browser:latest --load .
+docker save go-wb-browser:latest | ssh server docker load
+
+# На сервере: .env с OFDATA_KEY и ключами CRM, данные и кэш в ./data
+docker compose run --rm search wb-search -q "кроссовки мужские" -pages 3 -out /data/wb.csv
+docker compose run --rm search \
+  sh -c 'wb-sellers -q "кроссовки мужские" -limit 100 -enrich -enrich-ip \
+           -cache /data/cache.json -ids-out /data/ids.txt -format ndjson -out - | wb-crm'
+```
+
+Полные команды обоих сервисов собраны в шапке `docker-compose.yml`. Часовой пояс
+браузера задаёт переменная `TZ` (по умолчанию Europe/Moscow), экран 1920×1080 —
+`docker/entrypoint.sh`. Если Wildberries не выдаёт сессию с адреса сервера, это видно
+сразу: `wb-search` завершается ошибкой «кука x_wbaas_token не появилась».
+
 ## Структура проекта
 
 ```
 cmd/wb-sellers/      CLI: флаги, сигналы, вызов конвейера
 cmd/wb-search/       поиск товаров по запросу через браузер (go-rod)
+cmd/wb-crm/          CLI: продавцов из CSV/NDJSON wb-sellers в CRM
 internal/wbsearch/   wb.Source поверх cmd/wb-search: подпроцесс на запрос, разбор его CSV
 internal/wb/         предметная область: SellerHit, Source, Supplier, клиент CDN, разбор ввода
 internal/collect/    конвейер Runner: источник → пул воркеров → CSV/NDJSON
 internal/store/      Cache: память + JSON-файл, безопасен для горутин
 internal/ofdata/     обогащение из реестра OFData (ЕГРЮЛ/ЕГРИП)
+internal/crm/        заливка в CRM (Twenty): компания, контакт, сделка, дедупликация
 .github/workflows/   CI: сборка, vet, gofmt, тесты -race, golangci-lint, govulncheck
 .golangci.yml        набор линтеров и осознанные исключения
+Dockerfile           два образа: slim (без браузера) и browser (Chromium + Xvfb)
+docker-compose.yml   сервисы-команды search и import для сервера
+docker/              entrypoint с виртуальным экраном для образа browser
 ```
 
 ```mermaid
