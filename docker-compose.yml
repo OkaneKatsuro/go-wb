@@ -1,0 +1,18 @@
+# Серверная часть go-wb: по списку supplierId (его готовит wb-search у тебя
+# локально) обогащает через OFData и льёт продавцов в CRM. Браузера тут нет.
+#
+# Разовый прогон:
+#   docker compose run --rm import \
+#     sh -c 'wb-sellers -ids /data/ids.txt -enrich -enrich-ip -format ndjson -out - | wb-crm'
+#
+# Или по шагам, с сохранением выгрузки:
+#   docker compose run --rm import wb-sellers -ids /data/ids.txt -enrich -format ndjson -out /data/sellers.ndjson
+#   docker compose run --rm import wb-crm -in /data/sellers.ndjson
+services:
+  import:
+    image: go-wb:latest
+    build: .
+    env_file: .env          # OFDATA_KEY, TWENTY_API_URL, TWENTY_API_KEY
+    volumes:
+      - ./data:/data        # сюда кладёшь ids.txt; тут же кэш и выгрузки
+    profiles: ["cli"]       # один раз: docker compose run, не постоянный сервис
