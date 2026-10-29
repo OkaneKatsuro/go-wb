@@ -284,6 +284,23 @@ docker compose run --rm import \
            -format ndjson -out - | wb-crm'
 ```
 
+### wb-searchd: поиск как сервис для лидгена CRM
+
+Лидген в pipeline (fluttrium-pipeline, провайдер `LEADGEN_PROVIDER=gowb`) не
+запускает wb-search сам, а спрашивает сервис `wb-searchd` из того же образа:
+`GET /search?q=<запрос>&pages=N` отдаёт товары в полях витрины WB (`supplierId`,
+`feedbacks`, `totalQuantity`…), и pipeline сворачивает их в продавцов тем же кодом,
+что и прямую выдачу. Поиски идут по одному: на каждый поднимается свой браузер и
+закрывается по окончании, параллельные ждут в очереди; `-timeout` (3 мин) ограничивает
+один поиск. Сервис живёт в сети CRM-стека (`CRM_NETWORK`, по умолчанию
+`fluttrium-crm-app_default`) под именем `go-wb-searchd`, порт наружу не публикует и
+ключей не держит:
+
+```bash
+docker compose up -d searchd
+docker compose exec searchd wget -qO- 'http://localhost:8090/search?q=чай%20оптом&pages=1' | head -c 300
+```
+
 Шаги разделены намеренно: Chromium в контейнере работает без своей песочницы (так
 устроены все образы с go-rod и Puppeteer), а рисует он чужой сайт, поэтому ключи CRM
 и OFData до него не доходят. Полные команды обоих сервисов собраны в шапке
@@ -296,8 +313,10 @@ Europe/Moscow), экран 1920×1080 — `docker/entrypoint.sh`. Если Wildb
 
 ```
 cmd/wb-sellers/      CLI: флаги, сигналы, вызов конвейера
-cmd/wb-search/       поиск товаров по запросу через браузер (go-rod)
+cmd/wb-search/       CLI поиска товаров по запросу: CSV для wb-sellers
+cmd/wb-searchd/      HTTP-сервис поиска для лидгена CRM (pipeline)
 cmd/wb-crm/          CLI: продавцов из CSV/NDJSON wb-sellers в CRM
+internal/storefront/ поиск по витрине через браузер (go-rod + stealth): сессия, страницы, модель товара
 internal/wbsearch/   wb.Source поверх cmd/wb-search: подпроцесс на запрос, разбор его CSV
 internal/wb/         предметная область: SellerHit, Source, Supplier, клиент CDN, разбор ввода
 internal/collect/    конвейер Runner: источник → пул воркеров → CSV/NDJSON

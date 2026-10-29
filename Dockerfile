@@ -2,9 +2,9 @@
 #
 #   slim (по умолчанию): wb-sellers + wb-crm без браузера. Путь `-ids` ходит только
 #     в открытый CDN WB и OFData, образ около 30 МБ.
-#   browser: то же плюс wb-search с Chromium и виртуальным экраном Xvfb. wb-search
-#     открывает обычное окно браузера, как на ноутбуке, только экран виртуальный,
-#     поэтому код поиска не меняется. Песочницы Chromium в контейнере нет (go-rod
+#   browser: то же плюс wb-search и wb-searchd с Chromium и виртуальным экраном
+#     Xvfb. Браузер открывает обычное окно, как на ноутбуке, только экран
+#     виртуальный, поэтому код поиска не меняется. Песочницы Chromium в контейнере нет (go-rod
 #     добавляет --no-sandbox, увидев контейнер), поэтому ключи этому образу в compose
 #     не передаются: поиск отдаёт id продавцов, юрданные и CRM идут вторым шагом в slim.
 #
@@ -19,7 +19,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -o /out/ ./cmd/wb-sellers ./cmd/wb-crm ./cmd/wb-search
+    go build -trimpath -o /out/ ./cmd/wb-sellers ./cmd/wb-crm ./cmd/wb-search ./cmd/wb-searchd
 
 # --- browser: Chromium + Xvfb + все три команды -------------------------------
 FROM debian:trixie-slim AS browser
@@ -30,7 +30,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m -u 1001 app \
  && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
-COPY --from=build /out/wb-sellers /out/wb-crm /out/wb-search /usr/local/bin/
+COPY --from=build /out/wb-sellers /out/wb-crm /out/wb-search /out/wb-searchd /usr/local/bin/
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 # WB_BROWSER_BIN указывает wb-search на системный Chromium: без него go-rod
 # скачивает свой браузер при каждом запуске контейнера. TZ и DISPLAY можно

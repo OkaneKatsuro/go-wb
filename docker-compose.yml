@@ -14,7 +14,21 @@
 #              -format ndjson -out - | wb-crm'
 #   только заливка готовой выгрузки:
 #   docker compose run --rm import wb-crm -in /data/sellers.ndjson
+#
+# searchd — постоянный сервис для лидгена CRM (pipeline): тот же поиск, но по
+# HTTP, GET /search?q=…&pages=N. Живёт в сети CRM-стека под именем go-wb-searchd,
+# порт наружу не публикуется, ключей нет. Поднять: docker compose up -d searchd
 services:
+  searchd:
+    image: go-wb-browser:latest
+    build:
+      context: .
+      target: browser
+    container_name: go-wb-searchd
+    command: ["wb-searchd", "-addr", ":8090"]
+    restart: unless-stopped
+    networks: [crm]
+
   search:
     image: go-wb-browser:latest
     build:
@@ -33,3 +47,8 @@ services:
     volumes:
       - ./data:/data
     profiles: ["cli"]
+
+networks:
+  crm:
+    external: true
+    name: ${CRM_NETWORK:-fluttrium-crm-app_default}
