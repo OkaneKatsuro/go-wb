@@ -9,7 +9,15 @@ set -eu
 export DISPLAY
 num=${DISPLAY#:}
 
-Xvfb "$DISPLAY" -screen 0 1920x1080x24 -nolisten tcp -noreset >/dev/null 2>&1 &
+# Рестарт контейнера (ребут сервера, restart: unless-stopped) сохраняет /tmp, а с
+# ним lock-файл и сокет прошлого Xvfb. Новый Xvfb видит lock и сразу выходит, а
+# цикл ниже находит старый сокет и пускает сервис без экрана: так с 20.11.2026
+# четыре дня каждый поиск отдавал 502 «Missing X server or $DISPLAY». Наш Xvfb на
+# этом дисплее в контейнере единственный, поэтому чужого lock здесь быть не может.
+rm -f "/tmp/.X$num-lock" "/tmp/.X11-unix/X$num"
+
+# stderr Xvfb — в лог контейнера: без него причина отказа экрана не видна.
+Xvfb "$DISPLAY" -screen 0 1920x1080x24 -nolisten tcp -noreset >/dev/null &
 xvfb=$!
 
 i=0
